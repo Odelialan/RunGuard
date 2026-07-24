@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from typing import Any
+
+import httpx
+
 from .models import PolicySimulationRequest, RiskLevel
 
 READ_TOOLS = {
@@ -87,3 +91,91 @@ def evaluate_policy(
         "matched_policy": "readonly-or-reversible-staging",
         "reason": "Operation is read-only or reversible within an isolated environment.",
     }
+
+
+class PolicyEvaluator:
+    """OPA is authoritative in production; Python evaluation is an explicit demo backend."""
+
+    def __init__(
+        self,
+        backend: str,
+        opa_url: str | None,
+        *,
+        fail_closed: bool = True,
+        timeout_seconds: float = 3.0,
+    ) -> None:
+        self.backend = backend
+        self.opa_url = opa_url.rstrip("/") if opa_url else None
+        self.fail_closed = fail_closed
+        self.timeout_seconds = timeout_seconds
+
+    async def evaluate(
+        self,
+        payload: PolicySimulationRequest | dict[str, object],
+    ) -> dict[str, Any]:
+        data = (
+            payload.model_dump(mode="json")
+            if isinstance(payload, PolicySimulationRequest)
+            else dict(payload)
+        )
+        risk = str(
+            data.get("risk_level")
+            or classify_risk(str(data["tool"]), str(data["environment"]), data.get("arguments"))
+        )
+        data["risk_level"] = risk
+        if self.backend != "opa":
+            return evaluate_policy(data)
+        if not self.opa_url:
+            return self._unavailable(risk, "OPA backend selected without RUNGUARD_OPA_URL.")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.post(
+                    f"{self.opa_url}/v1/data/runguard/tool_intent/decision",
+                    json={"input": data},
+                )
+                response.raise_for_status()
+                body = response.json()
+            result = body.get("result")
+            if not isinstance(result, dict):
+                return self._unavailable(risk, "OPA returned an undefined policy decision.")
+            return {
+                "decision": result["decision"],
+                "risk_level": risk,
+                "matched_policy": result["matched_policy"],
+                "reason": result["reason"],
+                "decision_id": body.get("decision_id"),
+                "backend": "opa",
+            }
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+            return self._unavailable(risk, f"OPA evaluation failed: {exc}")
+
+    def _unavailable(self, risk: str, reason: str) -> dict[str, Any]:
+        if not self.fail_closed:
+            fallback = evaluate_policy(
+                {
+                    "tool": "unknown",
+                    "environment": "production",
+                    "risk_level": risk,
+                    "has_rollback": False,
+                }
+            )
+            return {**fallback, "backend": "python-fallback", "warning": reason}
+        return {
+            "decision": "deny",
+            "risk_level": risk,
+            "matched_policy": "opa-unavailable-fail-closed",
+            "reason": reason,
+            "backend": "opa",
+        }
+
+    async def health(self) -> str:
+        if self.backend != "opa":
+            return "python-demo"
+        if not self.opa_url:
+            return "unavailable"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+                response = await client.get(f"{self.opa_url}/health?bundles=true")
+            return "ready" if response.is_success else "unavailable"
+        except httpx.HTTPError:
+            return "unavailable"

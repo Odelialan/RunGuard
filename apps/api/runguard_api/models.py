@@ -88,4 +88,54 @@ class PolicySimulationRequest(BaseModel):
 class EvalRunRequest(BaseModel):
     suite: Literal["baseline-12"] = "baseline-12"
     model: str = "deterministic-demo"
-    prompt_version: str = "1.0.0"
+    prompt_version: str = "1.1.0"
+
+
+class PostmortemActionItem(BaseModel):
+    title: str
+    owner: str
+    priority: Literal["P0", "P1", "P2", "P3"] = "P2"
+    due_date: str | None = None
+    status: Literal["OPEN", "IN_PROGRESS", "DONE"] = "OPEN"
+
+
+class PostmortemDocument(BaseModel):
+    id: str | None = None
+    incident_id: str
+    run_id: str | None = None
+    status: Literal["DRAFT", "FINAL"] = "FINAL"
+    title: str
+    summary: str
+    impact: str
+    root_cause: str
+    contributing_factors: list[str] = Field(default_factory=list)
+    timeline: list[dict[str, str]] = Field(default_factory=list)
+    remediation: list[str] = Field(default_factory=list)
+    action_items: list[PostmortemActionItem] = Field(default_factory=list)
+    lessons: list[str] = Field(default_factory=list)
+    generated_by: str = "reporter-agent"
+
+
+class A2AMessagePart(BaseModel):
+    kind: str = "text"
+    text: str | None = None
+    data: dict[str, Any] | None = None
+
+
+class A2AMessage(BaseModel):
+    messageId: str
+    role: Literal["user", "agent"]
+    parts: list[A2AMessagePart]
+    contextId: str | None = None
+
+
+class A2ARequest(BaseModel):
+    jsonrpc: Literal["2.0"] = "2.0"
+    id: str | int
+    method: Literal["message/send"]
+    params: dict[str, Any]
+
+
+class EvidenceSearchRequest(BaseModel):
+    query: str = Field(min_length=3, max_length=1000)
+    limit: int = Field(default=8, ge=1, le=50)

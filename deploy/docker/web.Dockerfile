@@ -1,7 +1,7 @@
 FROM node:22-alpine AS builder
 WORKDIR /app
 COPY apps/web/package*.json ./
-RUN npm install
+RUN npm ci
 COPY apps/web ./
 RUN npm run build
 

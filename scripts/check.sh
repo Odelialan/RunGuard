@@ -4,9 +4,10 @@ set -euo pipefail
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$project_root"
 
-uv sync --extra dev
-uv run ruff check apps/api
+uv sync --all-extras
+uv run ruff check apps/api tests services
 uv run python -m compileall -q apps/api
+uv run pytest -q
 npm --prefix apps/web install
 npm --prefix apps/web run lint
 npm --prefix apps/web run build
@@ -17,7 +18,9 @@ from runguard_api.main import app
 
 client = TestClient(app)
 assert client.get("/api/health").status_code == 200
+assert client.get("/api/ready").status_code == 200
 assert client.get("/").status_code == 200
+assert client.get("/metrics").status_code == 200
 assert client.get("/api/overview").json()["incidents"] >= 4
 assert len(client.get("/api/incidents").json()) >= 4
 assert client.post(
@@ -42,7 +45,30 @@ assert client.post(
         "incident_severity": "P1"
     },
 ).json()["decision"] == "deny"
+assert client.get("/.well-known/agent-card.json").json()["protocolVersion"] == "1.0"
 print("API smoke checks passed")
+PY
+
+uv run python - <<'PY'
+from pathlib import Path
+
+import yaml
+
+files = [
+    Path("docker-compose.yml"),
+    Path("deploy/kind/cluster.yaml"),
+    Path("deploy/kind/platform.yaml"),
+    Path("deploy/kind/values.yaml"),
+    Path("deploy/observability/prometheus.yml"),
+    Path("deploy/observability/loki.yml"),
+    Path("deploy/observability/tempo.yml"),
+    Path("deploy/observability/otel-collector.yml"),
+    Path("deploy/observability/grafana-datasources.yml"),
+]
+for path in files:
+    documents = list(yaml.safe_load_all(path.read_text(encoding="utf-8")))
+    assert documents and all(document is not None for document in documents), path
+print("Deployment YAML checks passed")
 PY
 
 tracked_large_files="$(

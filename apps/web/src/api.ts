@@ -107,6 +107,20 @@ export type Overview = {
   recent_incidents: Incident[];
 };
 
+export type SystemHealth = {
+  status: string;
+  version: string;
+  execution_mode: string;
+  connector_mode: string;
+  agent_backend: string;
+  policy_backend: string;
+  database: string;
+  database_backend: string;
+  redis_stream: string;
+  opentelemetry: string;
+  frontend: string;
+};
+
 export type EvalRun = {
   id: string;
   suite: string;
@@ -116,6 +130,30 @@ export type EvalRun = {
   metrics: Record<string, number | string | boolean>;
   cases: Array<Record<string, string | number | boolean>>;
   created_at: string;
+};
+
+export type Postmortem = {
+  id: string;
+  incident_id: string;
+  run_id?: string;
+  status: string;
+  title: string;
+  summary: string;
+  impact: string;
+  root_cause: string;
+  contributing_factors: string[];
+  timeline: Array<{ at: string; event: string; actor: string; detail: string }>;
+  remediation: string[];
+  action_items: Array<{
+    title: string;
+    owner: string;
+    priority: string;
+    due_date?: string;
+    status: string;
+  }>;
+  lessons: string[];
+  generated_by: string;
+  updated_at: string;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -134,6 +172,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  health: () => request<SystemHealth>("/api/health"),
   overview: () => request<Overview>("/api/overview"),
   incidents: () => request<Incident[]>("/api/incidents"),
   incident: (id: string) => request<Incident>(`/api/incidents/${id}`),
@@ -170,7 +209,11 @@ export const api = {
       body: JSON.stringify({
         suite: "baseline-12",
         model: "deterministic-demo",
-        prompt_version: "1.0.0",
+        prompt_version: "1.1.0",
       }),
     }),
+  postmortem: (incidentId: string) =>
+    request<Postmortem>(`/api/incidents/${incidentId}/postmortem`),
+  generatePostmortem: (incidentId: string) =>
+    request<Postmortem>(`/api/incidents/${incidentId}/postmortem`, { method: "POST" }),
 };

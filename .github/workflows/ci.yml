@@ -25,11 +25,12 @@ jobs:
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
       - name: Install Python dependencies
-        run: uv sync --extra dev
+        run: uv sync --all-extras
       - name: Python checks
         run: |
-          uv run ruff check apps/api
+          uv run ruff check apps/api tests services
           uv run python -m compileall -q apps/api
+          uv run pytest -q
       - name: Install web dependencies
         run: npm --prefix apps/web ci
       - name: Typecheck and build web
@@ -44,7 +45,108 @@ jobs:
 
           client = TestClient(app)
           assert client.get("/api/health").status_code == 200
+          assert client.get("/api/ready").status_code == 200
           assert client.get("/api/overview").status_code == 200
           assert client.get("/api/incidents").status_code == 200
           print("API smoke test passed")
           PY
+
+  container-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.3
+      - name: Validate Compose and Helm
+        run: |
+          docker compose config --quiet
+          helm lint deploy/helm/runguard \
+            --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
+            --set-string secrets.openaiApiKey=ci-validation-only
+          helm template runguard deploy/helm/runguard \
+            --namespace runguard-system \
+            --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
+            --set-string secrets.openaiApiKey=ci-validation-only >/tmp/runguard-helm.yaml
+      - name: Test Rego with OPA
+        run: |
+          docker run --rm \
+            -v "$PWD/policies:/policies:ro" \
+            openpolicyagent/opa:1.18.2-static \
+            test /policies -v
+      - name: Build production images
+        run: |
+          docker build -f deploy/docker/api.Dockerfile -t runguard-api:ci .
+          docker build -f deploy/docker/web.Dockerfile -t runguard-web:ci .
+          docker build -f deploy/docker/fault-injector.Dockerfile -t runguard-fault-injector:ci .
+      - name: Start PostgreSQL, Redis and OPA
+        run: |
+          docker network create runguard-ci
+          docker run -d --name postgres --network runguard-ci \
+            -e POSTGRES_DB=runguard \
+            -e POSTGRES_USER=runguard \
+            -e POSTGRES_PASSWORD=runguard-ci \
+            pgvector/pgvector:pg16
+          docker run -d --name redis --network runguard-ci redis:7.4-alpine
+          docker run -d --name opa --network runguard-ci \
+            -v "$PWD/policies:/policies:ro" \
+            openpolicyagent/opa:1.18.2-static \
+            run --server --addr=0.0.0.0:8181 /policies/runguard.rego
+          for attempt in $(seq 1 30); do
+            docker exec postgres pg_isready -U runguard -d runguard && break
+            sleep 2
+          done
+          docker exec redis redis-cli ping
+      - name: Run production dependency integration
+        run: |
+          docker run -d --name runguard --network runguard-ci -p 8000:8000 \
+            -e RUNGUARD_DATABASE_URL=postgresql://runguard:runguard-ci@postgres:5432/runguard \
+            -e RUNGUARD_DATABASE_SEED=true \
+            -e RUNGUARD_REDIS_URL=redis://redis:6379/0 \
+            -e RUNGUARD_POLICY_BACKEND=opa \
+            -e RUNGUARD_OPA_URL=http://opa:8181 \
+            -e RUNGUARD_CONNECTOR_MODE=mock \
+            -e RUNGUARD_AGENT_BACKEND=deterministic \
+            -e RUNGUARD_EXECUTION_MODE=simulation \
+            runguard-api:ci
+          for attempt in $(seq 1 40); do
+            if curl -fsS http://127.0.0.1:8000/api/ready >/tmp/ready.json; then
+              break
+            fi
+            sleep 2
+          done
+          cat /tmp/ready.json
+          curl -fsS http://127.0.0.1:8000/ >/dev/null
+          curl -fsS -X POST http://127.0.0.1:8000/api/incidents \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"CI production integration","severity":"P2","service":"order-api","environment":"staging","description":"PostgreSQL and Redis validation."}' \
+            >/tmp/incident.json
+          curl -fsS http://127.0.0.1:8000/api/events/stream >/tmp/events.json
+          curl -fsS -X POST http://127.0.0.1:8000/api/policies/simulate \
+            -H 'Content-Type: application/json' \
+            -d '{"environment":"production","tool":"kubernetes.patch_deployment","resource":"order-api","risk_level":"R2","has_rollback":true,"incident_severity":"P1"}' \
+            >/tmp/policy.json
+          python - <<'PY'
+          import json
+          ready = json.load(open("/tmp/ready.json"))
+          events = json.load(open("/tmp/events.json"))
+          policy = json.load(open("/tmp/policy.json"))
+          assert ready["components"] == {
+              "database": "ready",
+              "redis": "ready",
+              "policy": "ready",
+          }
+          assert events and events[0]["event_type"] == "incident.created"
+          assert policy["decision"] == "require_approval"
+          assert policy["backend"] == "opa"
+          print("Container integration passed")
+          PY
+      - name: Print container logs on failure
+        if: failure()
+        run: |
+          docker logs runguard || true
+          docker logs postgres || true
+          docker logs redis || true
+          docker logs opa || true

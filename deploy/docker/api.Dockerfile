@@ -1,14 +1,24 @@
+FROM node:22-alpine AS web-builder
+WORKDIR /web
+COPY apps/web/package*.json ./
+RUN npm ci
+COPY apps/web ./
+RUN npm run build
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    RUNGUARD_DATABASE_PATH=/data/runguard.db
+    RUNGUARD_DATABASE_PATH=/data/runguard.db \
+    RUNGUARD_WEB_DIST=/app/apps/web/dist
 
 WORKDIR /app
 
 COPY pyproject.toml README.md VERSION ./
 COPY apps/api ./apps/api
-RUN pip install --no-cache-dir .
+COPY agents/prompts ./agents/prompts
+COPY --from=web-builder /web/dist ./apps/web/dist
+RUN pip install --no-cache-dir ".[production]"
 
 RUN useradd --create-home --uid 10001 runguard \
     && mkdir -p /data \

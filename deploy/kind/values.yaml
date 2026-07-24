@@ -1,0 +1,43 @@
+replicaCount: 1
+
+image:
+  repository: runguard
+  tag: kind
+  pullPolicy: IfNotPresent
+
+runnerImage:
+  repository: runguard
+  tag: kind
+
+service:
+  type: NodePort
+  port: 80
+
+config:
+  environment: kind
+  connectorMode: hybrid
+  agentBackend: deterministic
+  executionMode: kubernetes_job
+  policyBackend: opa
+  opaUrl: http://opa.runguard-system.svc:8181
+  prometheusUrl: ""
+  lokiUrl: ""
+  githubRepository: Odelialan/RunGuard
+  a2aReviewerUrl: ""
+  redisUrl: redis://redis.runguard-system.svc:6379/0
+  otelEndpoint: ""
+  databaseSeed: true
+  embeddingsEnabled: false
+  llmModel: gpt-5-mini
+  verificationUrlTemplate: http://fault-sentinel.runguard-system.svc/health
+
+secrets:
+  databaseUrl: postgresql://runguard:runguard-kind@postgres.runguard-system.svc:5432/runguard
+  openaiApiKey: kind-not-used
+  githubToken: ""
+
+autoscaling:
+  enabled: false
+
+networkPolicy:
+  enabled: false

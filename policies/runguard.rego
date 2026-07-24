@@ -18,40 +18,32 @@ decision := {
   "reason": "Destructive or arbitrary execution is outside the Agent permission boundary."
 } if {
   input.tool in r3_tools
-}
-
-decision := {
+} else := {
   "decision": "require_approval",
   "matched_policy": "prod-write-requires-human",
   "reason": "Production write operation requires SRE approval."
 } if {
   input.environment in {"production", "prod"}
   input.risk_level in {"R1", "R2"}
-}
-
-decision := {
+} else := {
   "decision": "require_approval",
   "matched_policy": "write-without-rollback-requires-human",
   "reason": "Write operation has no verified rollback action."
 } if {
   input.risk_level in {"R1", "R2"}
   not input.has_rollback
-}
-
-decision := {
+} else := {
   "decision": "allow",
   "matched_policy": "readonly-or-reversible-staging",
   "reason": "Operation is read-only or reversible within an isolated environment."
 } if {
   input.risk_level == "R0"
-}
-
-decision := {
+} else := {
   "decision": "allow",
   "matched_policy": "readonly-or-reversible-staging",
   "reason": "Operation is read-only or reversible within an isolated environment."
 } if {
   input.risk_level == "R1"
-  input.environment in {"staging", "development", "test"}
+  input.environment in {"staging", "development", "test", "kind", "runguard-system"}
   input.has_rollback
 }

@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "runguard.fullname" . }}
+  labels:
+    {{- include "runguard.labels" . | nindent 4 }}
+data:
+  RUNGUARD_ENVIRONMENT: {{ .Values.config.environment | quote }}
+  RUNGUARD_CONNECTOR_MODE: {{ .Values.config.connectorMode | quote }}
+  RUNGUARD_AGENT_BACKEND: {{ .Values.config.agentBackend | quote }}
+  RUNGUARD_EXECUTION_MODE: {{ .Values.config.executionMode | quote }}
+  RUNGUARD_POLICY_BACKEND: {{ .Values.config.policyBackend | quote }}
+  RUNGUARD_OPA_URL: {{ .Values.config.opaUrl | quote }}
+  RUNGUARD_OPA_FAIL_CLOSED: "true"
+  RUNGUARD_PROMETHEUS_URL: {{ .Values.config.prometheusUrl | quote }}
+  RUNGUARD_LOKI_URL: {{ .Values.config.lokiUrl | quote }}
+  RUNGUARD_GITHUB_REPOSITORY: {{ .Values.config.githubRepository | quote }}
+  RUNGUARD_A2A_REVIEWER_URL: {{ .Values.config.a2aReviewerUrl | quote }}
+  RUNGUARD_REDIS_URL: {{ .Values.config.redisUrl | quote }}
+  RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
+  RUNGUARD_DATABASE_SEED: {{ .Values.config.databaseSeed | quote }}
+  RUNGUARD_EMBEDDINGS_ENABLED: {{ .Values.config.embeddingsEnabled | quote }}
+  RUNGUARD_LLM_MODEL: {{ .Values.config.llmModel | quote }}
+  RUNGUARD_VERIFICATION_URL_TEMPLATE: {{ .Values.config.verificationUrlTemplate | quote }}
+  RUNGUARD_KUBERNETES_NAMESPACE: {{ .Release.Namespace | quote }}
+  RUNGUARD_KUBERNETES_SERVICE_ACCOUNT: {{ .Values.executorServiceAccount.name | quote }}
+  RUNGUARD_KUBERNETES_RUNNER_IMAGE: {{ printf "%s:%s" .Values.runnerImage.repository .Values.runnerImage.tag | quote }}

@@ -1,18 +1,142 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: runguard
+      POSTGRES_USER: runguard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-runguard-local-only}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U runguard -d runguard"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  opa:
+    image: openpolicyagent/opa:1.18.2-static
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --set=decision_logs.console=true
+      - /policies/runguard.rego
+    volumes:
+      - ./policies:/policies:ro
+    healthcheck:
+      test: ["CMD", "/opa", "eval", "1+1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    volumes:
+      - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  loki:
+    image: grafana/loki:3.5.3
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+    volumes:
+      - ./deploy/observability/loki.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+
+  tempo:
+    image: grafana/tempo:2.8.2
+    command: ["-config.file=/etc/tempo/tempo.yml"]
+    volumes:
+      - ./deploy/observability/tempo.yml:/etc/tempo/tempo.yml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.132.0
+    command: ["--config=/etc/otelcol/config.yml"]
+    volumes:
+      - ./deploy/observability/otel-collector.yml:/etc/otelcol/config.yml:ro
+    depends_on:
+      - tempo
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-runguard-local-only}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./deploy/observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/runguard.yml:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    ports:
+      - "3000:3000"
+
   api:
     build:
       context: .
       dockerfile: deploy/docker/api.Dockerfile
     environment:
-      RUNGUARD_DATABASE_PATH: /data/runguard.db
-      RUNGUARD_EXECUTION_MODE: simulation
-    volumes:
-      - runguard-data:/data
+      RUNGUARD_ENVIRONMENT: production
+      RUNGUARD_DATABASE_URL: postgresql://runguard:${POSTGRES_PASSWORD:-runguard-local-only}@postgres:5432/runguard
+      RUNGUARD_DATABASE_SEED: ${RUNGUARD_DATABASE_SEED:-true}
+      RUNGUARD_REDIS_URL: redis://redis:6379/0
+      RUNGUARD_POLICY_BACKEND: opa
+      RUNGUARD_OPA_URL: http://opa:8181
+      RUNGUARD_OPA_FAIL_CLOSED: "true"
+      RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      RUNGUARD_CONNECTOR_MODE: ${RUNGUARD_CONNECTOR_MODE:-mock}
+      RUNGUARD_AGENT_BACKEND: ${RUNGUARD_AGENT_BACKEND:-deterministic}
+      RUNGUARD_EXECUTION_MODE: ${RUNGUARD_EXECUTION_MODE:-simulation}
+      RUNGUARD_PROMETHEUS_URL: http://prometheus:9090
+      RUNGUARD_LOKI_URL: http://loki:3100
+      RUNGUARD_GITHUB_REPOSITORY: ${RUNGUARD_GITHUB_REPOSITORY:-Odelialan/RunGuard}
+      RUNGUARD_GITHUB_TOKEN: ${RUNGUARD_GITHUB_TOKEN:-}
+      RUNGUARD_LLM_MODEL: ${RUNGUARD_LLM_MODEL:-gpt-5-mini}
+      RUNGUARD_EMBEDDINGS_ENABLED: ${RUNGUARD_EMBEDDINGS_ENABLED:-false}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opa:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready')",
+        ]
       interval: 10s
-      timeout: 3s
-      retries: 5
+      timeout: 5s
+      retries: 12
 
   web:
     build:
@@ -24,5 +148,19 @@ services:
     ports:
       - "5173:80"
 
+  fault-injector:
+    build:
+      context: .
+      dockerfile: deploy/docker/fault-injector.Dockerfile
+    environment:
+      FAULT_INJECTOR_TOKEN: ${FAULT_INJECTOR_TOKEN:-local-demo-token}
+    ports:
+      - "8090:8090"
+
 volumes:
-  runguard-data:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  loki-data:
+  tempo-data:
+  grafana-data:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 from collections.abc import Iterable
@@ -10,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from .models import IncidentCreate, IncidentStatus
+from .telemetry import Telemetry
 
 
 def utc_now() -> str:
@@ -20,14 +22,65 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+class _PostgresConnection:
+    def __init__(self, database_url: str) -> None:
+        self.database_url = database_url
+        self.raw: Any = None
+
+    def __enter__(self) -> _PostgresConnection:
+        import psycopg
+        from psycopg.rows import dict_row
+
+        self.raw = psycopg.connect(self.database_url, row_factory=dict_row)
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is None:
+            self.raw.commit()
+        else:
+            self.raw.rollback()
+        self.raw.close()
+
+    @staticmethod
+    def _query(query: str, parameters: Any) -> str:
+        if isinstance(parameters, dict):
+            return re.sub(r"(?<!:):([A-Za-z_][A-Za-z0-9_]*)", r"%(\1)s", query)
+        return query.replace("?", "%s")
+
+    def execute(self, query: str, parameters: Any = None):
+        parameters = () if parameters is None else parameters
+        return self.raw.execute(self._query(query, parameters), parameters, prepare=False)
+
+    def executescript(self, script: str) -> None:
+        for statement in script.split(";"):
+            if statement.strip():
+                self.raw.execute(statement, prepare=False)
+
+
 class Store:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(
+        self,
+        database_path: Path,
+        database_url: str | None = None,
+        *,
+        seed: bool = True,
+        vector_dimensions: int = 1536,
+        telemetry: Telemetry | None = None,
+    ) -> None:
         self.database_path = database_path
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.database_url = database_url
+        self.backend = "postgresql" if database_url else "sqlite"
+        self.seed = seed
+        self.vector_dimensions = vector_dimensions
+        self.telemetry = telemetry
+        if not database_url:
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._initialize()
 
-    def connect(self) -> sqlite3.Connection:
+    def connect(self) -> sqlite3.Connection | _PostgresConnection:
+        if self.database_url:
+            return _PostgresConnection(self.database_url)
         connection = sqlite3.connect(self.database_path, timeout=30, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
@@ -154,14 +207,49 @@ class Store:
             cases TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS postmortems (
+            id TEXT PRIMARY KEY,
+            incident_id TEXT NOT NULL UNIQUE REFERENCES incidents(id),
+            run_id TEXT,
+            status TEXT NOT NULL,
+            title TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            impact TEXT NOT NULL,
+            root_cause TEXT NOT NULL,
+            contributing_factors TEXT NOT NULL,
+            timeline TEXT NOT NULL,
+            remediation TEXT NOT NULL,
+            action_items TEXT NOT NULL,
+            lessons TEXT NOT NULL,
+            generated_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
         """
         with self._lock, self.connect() as connection:
+            if self.backend == "postgresql":
+                connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
             connection.executescript(schema)
-            count = connection.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
-            if count == 0:
+            if self.backend == "postgresql":
+                connection.execute(
+                    f"ALTER TABLE evidence ADD COLUMN IF NOT EXISTS "
+                    f"embedding vector({self.vector_dimensions})"
+                )
+                connection.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS evidence_embedding_hnsw
+                    ON evidence USING hnsw (embedding vector_cosine_ops)
+                    WHERE embedding IS NOT NULL
+                    """
+                )
+            count_row = connection.execute("SELECT COUNT(*) AS count FROM incidents").fetchone()
+            count = count_row["count"] if isinstance(count_row, dict) else count_row[0]
+            if count == 0 and self.seed:
                 self._seed(connection)
 
-    def _next_incident_id(self, connection: sqlite3.Connection) -> str:
+    def _next_incident_id(self, connection: Any) -> str:
+        if self.backend == "postgresql":
+            connection.execute("SELECT pg_advisory_xact_lock(20260724)")
         year = datetime.now(UTC).year
         row = connection.execute(
             "SELECT id FROM incidents WHERE id LIKE ? ORDER BY id DESC LIMIT 1",
@@ -467,10 +555,18 @@ class Store:
         payload: dict[str, Any],
         created_at: str | None = None,
     ) -> dict[str, Any]:
-        sequence = connection.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM incident_events WHERE incident_id = ?",
+        sequence_row = connection.execute(
+            """
+            SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
+            FROM incident_events WHERE incident_id = ?
+            """,
             (incident_id,),
-        ).fetchone()[0]
+        ).fetchone()
+        sequence = (
+            sequence_row["next_sequence"]
+            if isinstance(sequence_row, dict)
+            else sequence_row[0]
+        )
         event = {
             "id": f"EVT-{uuid4().hex[:10].upper()}",
             "incident_id": incident_id,
@@ -616,7 +712,14 @@ class Store:
             )
         return self.get_incident(incident_id)
 
-    def create_run(self, incident_id: str, prompt_version: str) -> str:
+    def create_run(
+        self,
+        incident_id: str,
+        prompt_version: str,
+        *,
+        graph_version: str = "incident-response-v1",
+        model_config: dict[str, Any] | None = None,
+    ) -> str:
         run_id = f"RUN-{uuid4().hex[:8].upper()}"
         with self._lock, self.connect() as connection:
             connection.execute(
@@ -624,13 +727,16 @@ class Store:
                 INSERT INTO agent_runs
                     (id, incident_id, graph_version, prompt_version, model_config,
                      status, started_at)
-                VALUES (?, ?, 'incident-response-v1', ?, ?, 'RUNNING', ?)
+                VALUES (?, ?, ?, ?, ?, 'RUNNING', ?)
                 """,
                 (
                     run_id,
                     incident_id,
+                    graph_version,
                     prompt_version,
-                    json_dumps({"provider": "deterministic", "model": "demo-v1"}),
+                    json_dumps(
+                        model_config or {"provider": "deterministic", "model": "demo-v1"}
+                    ),
                     utc_now(),
                 ),
             )
@@ -697,6 +803,22 @@ class Store:
         duration_ms: int,
         attributes: dict[str, Any] | None = None,
     ) -> str:
+        trace_attributes = dict(attributes or {})
+        if self.telemetry is not None:
+            trace_id, span_id = self.telemetry.record(
+                name,
+                duration_ms,
+                {
+                    **trace_attributes,
+                    "run_id": run_id,
+                    "incident_id": incident_id,
+                    "span_type": span_type,
+                    "agent": agent or "system",
+                },
+                status,
+            )
+            if trace_id and span_id:
+                trace_attributes.update({"otel_trace_id": trace_id, "otel_span_id": span_id})
         with self._lock, self.connect() as connection:
             return self._insert_trace_tx(
                 connection,
@@ -707,7 +829,7 @@ class Store:
                 agent,
                 status,
                 duration_ms,
-                attributes or {},
+                trace_attributes,
                 utc_now(),
             )
 
@@ -979,6 +1101,149 @@ class Store:
             "rollback_result",
         )
 
+    def record_rollback(
+        self,
+        intent_id: str,
+        rollback_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE execution_results SET rollback_result = ?
+                WHERE tool_intent_id = ?
+                """,
+                (json_dumps(rollback_result), intent_id),
+            )
+            connection.execute(
+                "UPDATE tool_intents SET status = 'ROLLED_BACK' WHERE id = ?",
+                (intent_id,),
+            )
+            row = connection.execute(
+                "SELECT * FROM execution_results WHERE tool_intent_id = ?",
+                (intent_id,),
+            ).fetchone()
+        if not row:
+            raise KeyError(intent_id)
+        return self._decode(
+            row,
+            "result",
+            "before_snapshot",
+            "after_snapshot",
+            "rollback_result",
+        )
+
+    def upsert_evidence_embedding(self, evidence_id: str, embedding: list[float]) -> None:
+        if self.backend != "postgresql":
+            return
+        with self._lock, self.connect() as connection:
+            from pgvector.psycopg import register_vector
+
+            register_vector(connection.raw)
+            connection.execute(
+                "UPDATE evidence SET embedding = ? WHERE id = ?",
+                (embedding, evidence_id),
+            )
+
+    def semantic_evidence(self, embedding: list[float], limit: int = 8) -> list[dict[str, Any]]:
+        if self.backend != "postgresql":
+            return []
+        with self.connect() as connection:
+            from pgvector.psycopg import register_vector
+
+            register_vector(connection.raw)
+            rows = connection.execute(
+                """
+                SELECT id, incident_id, source_type, source_uri, title, content, observed_at,
+                       metadata, 1 - (embedding <=> ?) AS similarity
+                FROM evidence
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> ?
+                LIMIT ?
+                """,
+                (embedding, embedding, limit),
+            ).fetchall()
+        return [self._decode(row, "metadata") for row in rows]
+
+    def upsert_postmortem(self, incident_id: str, document: dict[str, Any]) -> dict[str, Any]:
+        postmortem_id = document.get("id") or f"PM-{uuid4().hex[:8].upper()}"
+        now = utc_now()
+        fields = {
+            "id": postmortem_id,
+            "incident_id": incident_id,
+            "run_id": document.get("run_id"),
+            "status": document.get("status", "FINAL"),
+            "title": document["title"],
+            "summary": document["summary"],
+            "impact": document["impact"],
+            "root_cause": document["root_cause"],
+            "contributing_factors": json_dumps(document.get("contributing_factors", [])),
+            "timeline": json_dumps(document.get("timeline", [])),
+            "remediation": json_dumps(document.get("remediation", [])),
+            "action_items": json_dumps(document.get("action_items", [])),
+            "lessons": json_dumps(document.get("lessons", [])),
+            "generated_by": document.get("generated_by", "reporter-agent"),
+            "created_at": now,
+            "updated_at": now,
+        }
+        with self._lock, self.connect() as connection:
+            existing = connection.execute(
+                "SELECT created_at FROM postmortems WHERE incident_id = ?",
+                (incident_id,),
+            ).fetchone()
+            if existing:
+                fields["created_at"] = existing["created_at"]
+                connection.execute(
+                    """
+                    UPDATE postmortems SET run_id = :run_id, status = :status, title = :title,
+                        summary = :summary, impact = :impact, root_cause = :root_cause,
+                        contributing_factors = :contributing_factors, timeline = :timeline,
+                        remediation = :remediation, action_items = :action_items,
+                        lessons = :lessons, generated_by = :generated_by,
+                        updated_at = :updated_at
+                    WHERE incident_id = :incident_id
+                    """,
+                    fields,
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO postmortems
+                        (id, incident_id, run_id, status, title, summary, impact, root_cause,
+                         contributing_factors, timeline, remediation, action_items, lessons,
+                         generated_by, created_at, updated_at)
+                    VALUES (:id, :incident_id, :run_id, :status, :title, :summary, :impact,
+                            :root_cause, :contributing_factors, :timeline, :remediation,
+                            :action_items, :lessons, :generated_by, :created_at, :updated_at)
+                    """,
+                    fields,
+                )
+        return self.get_postmortem(incident_id)
+
+    def get_postmortem(self, incident_id: str) -> dict[str, Any]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM postmortems WHERE incident_id = ?",
+                (incident_id,),
+            ).fetchone()
+        if not row:
+            raise KeyError(incident_id)
+        return self._decode(
+            row,
+            "contributing_factors",
+            "timeline",
+            "remediation",
+            "action_items",
+            "lessons",
+        )
+
+    def database_health(self) -> str:
+        try:
+            with self.connect() as connection:
+                connection.execute("SELECT 1").fetchone()
+            return "ready"
+        except Exception:
+            return "unavailable"
+
     def finish_run(
         self,
         run_id: str,
@@ -1113,11 +1378,11 @@ class Store:
         }
 
     @staticmethod
-    def _row(row: sqlite3.Row) -> dict[str, Any]:
+    def _row(row: Any) -> dict[str, Any]:
         return dict(row)
 
     @staticmethod
-    def _decode(row: sqlite3.Row, *fields: str) -> dict[str, Any]:
+    def _decode(row: Any, *fields: str) -> dict[str, Any]:
         result = dict(row)
         for field in fields:
             value = result.get(field)

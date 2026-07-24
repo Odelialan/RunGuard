@@ -1,0 +1,73 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/odelialan/runguard
+  tag: "1.1.0"
+  pullPolicy: IfNotPresent
+
+runnerImage:
+  repository: ghcr.io/odelialan/runguard-runner
+  tag: "1.1.0"
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+  className: nginx
+  host: runguard.example.com
+  tlsSecret: ""
+
+config:
+  environment: production
+  connectorMode: production
+  agentBackend: langgraph
+  executionMode: kubernetes_job
+  policyBackend: opa
+  opaUrl: http://opa.runguard-system.svc:8181
+  prometheusUrl: http://prometheus.monitoring.svc:9090
+  lokiUrl: http://loki.monitoring.svc:3100
+  githubRepository: Odelialan/RunGuard
+  a2aReviewerUrl: ""
+  redisUrl: redis://redis.runguard-system.svc:6379/0
+  otelEndpoint: http://otel-collector.observability.svc:4318
+  databaseSeed: false
+  embeddingsEnabled: true
+  llmModel: gpt-5-mini
+  verificationUrlTemplate: ""
+
+secrets:
+  databaseUrl: ""
+  openaiApiKey: ""
+  githubToken: ""
+  a2aReviewerToken: ""
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+
+serviceAccount:
+  create: true
+  name: runguard-api
+
+executorServiceAccount:
+  create: true
+  name: runguard-executor

@@ -1,0 +1,204 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import time
+from dataclasses import dataclass
+from typing import Any
+from uuid import uuid4
+
+from .config import Settings
+from .gateway import ToolContext, ToolResult
+
+
+@dataclass(frozen=True)
+class KubernetesJobSpec:
+    tool_name: str
+    arguments: dict[str, Any]
+    rollback: bool = False
+
+
+class KubernetesJobExecutor:
+    """Runs allow-listed mutations inside a short-lived, restricted Kubernetes Job."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self._configured = False
+
+    def _configure(self) -> None:
+        if self._configured:
+            return
+        from kubernetes import config
+
+        try:
+            config.load_incluster_config()
+        except config.ConfigException:
+            config.load_kube_config(context=self.settings.kubernetes_context)
+        self._configured = True
+
+    async def execute(
+        self,
+        spec: KubernetesJobSpec,
+        context: ToolContext,
+    ) -> ToolResult:
+        started = time.perf_counter()
+        try:
+            data = await asyncio.to_thread(self._execute_sync, spec, context)
+            ok = data.get("status") == "succeeded"
+        except Exception as exc:
+            data = {"status": "failed", "error": str(exc), "rollback": spec.rollback}
+            ok = False
+        return ToolResult(
+            ok=ok,
+            data=data,
+            source_uri=(
+                f"k8s://{self.settings.kubernetes_namespace}/job/"
+                f"{data.get('job_name', 'creation-failed')}"
+            ),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+    def _execute_sync(
+        self,
+        spec: KubernetesJobSpec,
+        context: ToolContext,
+    ) -> dict[str, Any]:
+        from kubernetes import client
+
+        self._configure()
+        batch = client.BatchV1Api()
+        core = client.CoreV1Api()
+        suffix = uuid4().hex[:8]
+        job_name = f"runguard-{context.incident_id.lower().replace('_', '-')[-20:]}-{suffix}"
+        idempotency_label = hashlib.sha256(
+            context.idempotency_key.encode("utf-8")
+        ).hexdigest()[:24]
+        payload = {
+            "tool": spec.tool_name,
+            "arguments": spec.arguments,
+            "rollback": spec.rollback,
+            "incident_id": context.incident_id,
+            "run_id": context.run_id,
+            "actor": context.actor,
+            "idempotency_key": context.idempotency_key,
+        }
+        labels = {
+            "app.kubernetes.io/name": "runguard-executor",
+            "app.kubernetes.io/managed-by": "runguard",
+            "runguard.io/incident": context.incident_id.lower(),
+            "runguard.io/idempotency": idempotency_label,
+        }
+        security = client.V1SecurityContext(
+            allow_privilege_escalation=False,
+            capabilities=client.V1Capabilities(drop=["ALL"]),
+            privileged=False,
+            read_only_root_filesystem=True,
+            run_as_non_root=True,
+            run_as_user=10001,
+            seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+        )
+        pod_security = client.V1PodSecurityContext(
+            run_as_non_root=True,
+            run_as_user=10001,
+            run_as_group=10001,
+            fs_group=10001,
+            seccomp_profile=client.V1SeccompProfile(type="RuntimeDefault"),
+        )
+        container = client.V1Container(
+            name="executor",
+            image=self.settings.kubernetes_runner_image,
+            args=["python", "-m", "runguard_api.runner"],
+            env=[
+                client.V1EnvVar(name="RUNGUARD_TOOL_INTENT_JSON", value=json.dumps(payload)),
+            ],
+            resources=client.V1ResourceRequirements(
+                requests={"cpu": "25m", "memory": "64Mi"},
+                limits={"cpu": "250m", "memory": "256Mi"},
+            ),
+            security_context=security,
+            volume_mounts=[
+                client.V1VolumeMount(name="tmp", mount_path="/tmp"),
+            ],
+        )
+        template = client.V1PodTemplateSpec(
+            metadata=client.V1ObjectMeta(labels=labels),
+            spec=client.V1PodSpec(
+                automount_service_account_token=True,
+                containers=[container],
+                restart_policy="Never",
+                service_account_name=self.settings.kubernetes_service_account,
+                security_context=pod_security,
+                termination_grace_period_seconds=10,
+                volumes=[client.V1Volume(name="tmp", empty_dir=client.V1EmptyDirVolumeSource())],
+            ),
+        )
+        job = client.V1Job(
+            metadata=client.V1ObjectMeta(
+                name=job_name,
+                namespace=self.settings.kubernetes_namespace,
+                labels=labels,
+                annotations={
+                    "runguard.io/run-id": context.run_id,
+                    "runguard.io/idempotency-key": context.idempotency_key,
+                },
+            ),
+            spec=client.V1JobSpec(
+                template=template,
+                backoff_limit=0,
+                active_deadline_seconds=self.settings.kubernetes_job_timeout_seconds,
+                ttl_seconds_after_finished=600,
+            ),
+        )
+        existing = batch.list_namespaced_job(
+            self.settings.kubernetes_namespace,
+            label_selector=f"runguard.io/idempotency={idempotency_label}",
+        ).items
+        if existing:
+            job_name = existing[0].metadata.name
+        else:
+            batch.create_namespaced_job(self.settings.kubernetes_namespace, job)
+        deadline = time.monotonic() + self.settings.kubernetes_job_timeout_seconds
+        status = "running"
+        while time.monotonic() < deadline:
+            current = batch.read_namespaced_job_status(
+                job_name,
+                self.settings.kubernetes_namespace,
+            )
+            if current.status.succeeded:
+                status = "succeeded"
+                break
+            if current.status.failed:
+                status = "failed"
+                break
+            time.sleep(2)
+        else:
+            status = "timeout"
+        pods = core.list_namespaced_pod(
+            self.settings.kubernetes_namespace,
+            label_selector=f"job-name={job_name}",
+        ).items
+        logs = ""
+        if pods:
+            try:
+                logs = core.read_namespaced_pod_log(
+                    pods[0].metadata.name,
+                    self.settings.kubernetes_namespace,
+                    tail_lines=200,
+                )
+            except Exception:
+                logs = ""
+        parsed: dict[str, Any] = {}
+        for line in reversed(logs.splitlines()):
+            try:
+                parsed = json.loads(line)
+                break
+            except json.JSONDecodeError:
+                continue
+        return {
+            "status": status,
+            "job_name": job_name,
+            "namespace": self.settings.kubernetes_namespace,
+            "rollback": spec.rollback,
+            "runner_result": parsed,
+        }

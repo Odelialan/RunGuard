@@ -17,6 +17,7 @@ import {
   Code2,
   Database,
   FileClock,
+  FileText,
   Fingerprint,
   Gauge,
   GitBranch,
@@ -53,9 +54,12 @@ import {
   Evidence,
   Incident,
   Overview,
+  Postmortem,
+  SystemHealth,
   ToolIntent,
   TraceSpan,
 } from "./api";
+import { initialLanguage, Language, useDocumentLanguage } from "./i18n";
 
 type View =
   | "overview"
@@ -63,6 +67,7 @@ type View =
   | "incident"
   | "approvals"
   | "traces"
+  | "postmortems"
   | "evaluations"
   | "policies";
 
@@ -73,6 +78,7 @@ const NAV_ITEMS = [
   { id: "incidents" as View, label: "Incidents", icon: AlertTriangle },
   { id: "approvals" as View, label: "Approval center", icon: ClipboardCheck },
   { id: "traces" as View, label: "Trace explorer", icon: GitBranch },
+  { id: "postmortems" as View, label: "Postmortems", icon: FileText },
   { id: "evaluations" as View, label: "Evaluations", icon: BarChart3 },
   { id: "policies" as View, label: "Policy simulator", icon: ShieldCheck },
 ];
@@ -90,9 +96,11 @@ const STATUS_ORDER = [
 ];
 
 function App() {
+  const [language, setLanguage] = useState<Language>(initialLanguage);
   const [view, setView] = useState<View>("overview");
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [overview, setOverview] = useState<Overview | null>(null);
+  const [health, setHealth] = useState<SystemHealth | null>(null);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [approvals, setApprovals] = useState<ToolIntent[]>([]);
   const [traces, setTraces] = useState<TraceSpan[]>([]);
@@ -101,18 +109,21 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [toast, setToast] = useState<Toast | null>(null);
+  useDocumentLanguage(language);
 
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextOverview, nextIncidents, nextApprovals, nextTraces, nextEvaluations] =
+      const [nextHealth, nextOverview, nextIncidents, nextApprovals, nextTraces, nextEvaluations] =
         await Promise.all([
+          api.health(),
           api.overview(),
           api.incidents(),
           api.approvals(),
           api.traces(),
           api.evaluations(),
         ]);
+      setHealth(nextHealth);
       setOverview(nextOverview);
       setIncidents(nextIncidents);
       setApprovals(nextApprovals);
@@ -157,6 +168,7 @@ function App() {
         view={view}
         open={sidebarOpen}
         approvals={approvals.length}
+        health={health}
         onNavigate={navigate}
         onClose={() => setSidebarOpen(false)}
       />
@@ -167,6 +179,8 @@ function App() {
           onCreate={() => setCreateOpen(true)}
           onRefresh={() => void refresh()}
           loading={loading}
+          language={language}
+          onLanguageChange={() => setLanguage((current) => (current === "en" ? "zh" : "en"))}
         />
         <div className="content">
           {loading && !overview ? (
@@ -205,6 +219,9 @@ function App() {
                 />
               )}
               {view === "traces" && <TraceExplorer traces={traces} />}
+              {view === "postmortems" && (
+                <PostmortemPage incidents={incidents} showToast={setToast} />
+              )}
               {view === "evaluations" && (
                 <EvaluationDashboard
                   runs={evaluations}
@@ -243,12 +260,14 @@ function Sidebar({
   view,
   open,
   approvals,
+  health,
   onNavigate,
   onClose,
 }: {
   view: View;
   open: boolean;
   approvals: number;
+  health: SystemHealth | null;
   onNavigate: (view: View) => void;
   onClose: () => void;
 }) {
@@ -262,7 +281,7 @@ function Sidebar({
           </div>
           <div>
             <div className="brand-name">RunGuard</div>
-            <div className="brand-version">TRUSTED OPS · V1.0</div>
+            <div className="brand-version">TRUSTED OPS · V1.1</div>
           </div>
           <button className="icon-button sidebar-close" onClick={onClose}>
             <X size={19} />
@@ -303,15 +322,17 @@ function Sidebar({
           </div>
           <div className="status-row">
             <span>Agent runtime</span>
-            <strong>Healthy</strong>
+            <strong>{health?.agent_backend === "langgraph" ? "LangGraph" : "Deterministic"}</strong>
           </div>
           <div className="status-row">
             <span>Policy gateway</span>
-            <strong>Enforced</strong>
+            <strong>{health?.policy_backend === "opa" ? "OPA enforced" : "Python demo"}</strong>
           </div>
           <div className="status-row">
             <span>Execution</span>
-            <strong>Simulation</strong>
+            <strong>
+              {health?.execution_mode === "kubernetes_job" ? "Kubernetes Job" : "Simulation"}
+            </strong>
           </div>
         </div>
         <div className="user-row">
@@ -334,12 +355,16 @@ function Header({
   onCreate,
   onRefresh,
   loading,
+  language,
+  onLanguageChange,
 }: {
   title: string;
   onMenu: () => void;
   onCreate: () => void;
   onRefresh: () => void;
   loading: boolean;
+  language: Language;
+  onLanguageChange: () => void;
 }) {
   return (
     <header className="topbar">
@@ -364,6 +389,17 @@ function Header({
         <button className="icon-button notification-button" aria-label="Notifications">
           <Bell size={17} />
           <span />
+        </button>
+        <button
+          className="language-button"
+          type="button"
+          onClick={onLanguageChange}
+          aria-label={language === "en" ? "切换为中文" : "Switch to English"}
+          data-i18n-skip
+        >
+          <span className={language === "zh" ? "active" : ""}>中</span>
+          <i />
+          <span className={language === "en" ? "active" : ""}>EN</span>
         </button>
         <button className="primary-button" onClick={onCreate}>
           <Plus size={17} />
@@ -484,7 +520,7 @@ function OverviewPage({
           <div className="response-flow">
             <FlowNode icon={Bell} label="Signal" detail="Validated" state="done" />
             <FlowConnector />
-            <FlowNode icon={Bot} label="Investigate" detail="4 agents" state="done" />
+            <FlowNode icon={Bot} label="Investigate" detail="5 agents" state="done" />
             <FlowConnector />
             <FlowNode icon={Shield} label="Policy" detail="Enforced" state="active" />
             <FlowConnector />
@@ -860,7 +896,7 @@ function IncidentWorkspace({
         <aside className="workspace-side">
           <div className="panel run-summary">
             <PanelHeader title="Run telemetry" subtitle={latestRun?.id ?? "No run started"} />
-            <SummaryStat icon={Sparkles} label="Prompt version" value={latestRun?.prompt_version ?? "1.0.0"} />
+            <SummaryStat icon={Sparkles} label="Prompt version" value={latestRun?.prompt_version ?? "1.1.0"} />
             <SummaryStat icon={Code2} label="Tokens" value={formatNumber(latestRun?.token_usage ?? 0)} />
             <SummaryStat icon={TerminalSquare} label="Tool calls" value={String(latestRun?.tool_calls ?? 0)} />
             <SummaryStat
@@ -1555,6 +1591,174 @@ function EvaluationDashboard({
   );
 }
 
+function PostmortemPage({
+  incidents,
+  showToast,
+}: {
+  incidents: Incident[];
+  showToast: (toast: Toast) => void;
+}) {
+  const candidates = incidents.filter((incident) =>
+    ["RESOLVED", "ROLLED_BACK", "HUMAN_HANDOFF"].includes(incident.status),
+  );
+  const [selected, setSelected] = useState<string>(candidates[0]?.id ?? "");
+  const [document, setDocument] = useState<Postmortem | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!selected) return;
+    let active = true;
+    setLoading(true);
+    api
+      .postmortem(selected)
+      .then((result) => {
+        if (active) setDocument(result);
+      })
+      .catch(() => {
+        if (active) setDocument(null);
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selected]);
+
+  const generate = async () => {
+    if (!selected) return;
+    setLoading(true);
+    try {
+      const result = await api.generatePostmortem(selected);
+      setDocument(result);
+      showToast({ message: "Structured postmortem generated", tone: "success" });
+    } catch (error) {
+      showToast({ message: (error as Error).message, tone: "error" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <section className="page-stack">
+      <div className="page-intro slim">
+        <div>
+          <div className="eyebrow">LEARNING SYSTEM</div>
+          <h1>Postmortems</h1>
+          <p>Turn evidence, decisions, execution, and verification into a structured record.</p>
+        </div>
+        <div className="postmortem-actions">
+          <select value={selected} onChange={(event) => setSelected(event.target.value)}>
+            {candidates.map((incident) => (
+              <option value={incident.id} key={incident.id}>
+                {incident.id} · {incident.title}
+              </option>
+            ))}
+          </select>
+          <button className="secondary-button" onClick={() => void generate()} disabled={!selected || loading}>
+            <Sparkles size={15} />
+            {document ? "Regenerate" : "Generate report"}
+          </button>
+          {document && (
+            <a
+              className="primary-button postmortem-export"
+              href={`/api/incidents/${document.incident_id}/postmortem/export`}
+            >
+              <FileText size={15} />
+              Export Markdown
+            </a>
+          )}
+        </div>
+      </div>
+
+      {!candidates.length ? (
+        <div className="empty-state">
+          <FileClock size={28} />
+          <h2>No closed incidents yet</h2>
+          <p>Resolve or roll back an incident before generating a postmortem.</p>
+        </div>
+      ) : loading && !document ? (
+        <LoadingState />
+      ) : !document ? (
+        <div className="empty-state">
+          <FileText size={28} />
+          <h2>No report generated</h2>
+          <p>Create a structured postmortem from the immutable incident record.</p>
+          <button className="primary-button" onClick={() => void generate()}>
+            Generate report
+          </button>
+        </div>
+      ) : (
+        <article className="postmortem-document">
+          <header className="postmortem-hero">
+            <div>
+              <span>{document.status} · {document.generated_by}</span>
+              <h2>{document.title}</h2>
+              <p>{document.summary}</p>
+            </div>
+            <div className="postmortem-meta">
+              <span>Incident</span>
+              <strong>{document.incident_id}</strong>
+              <span>Run</span>
+              <strong>{document.run_id ?? "n/a"}</strong>
+            </div>
+          </header>
+          <div className="postmortem-grid">
+            <section>
+              <h3>Impact</h3>
+              <p>{document.impact}</p>
+            </section>
+            <section>
+              <h3>Root cause</h3>
+              <p>{document.root_cause}</p>
+            </section>
+          </div>
+          <section className="postmortem-section">
+            <h3>Contributing factors</h3>
+            <ul>{document.contributing_factors.map((item) => <li key={item}>{item}</li>)}</ul>
+          </section>
+          <section className="postmortem-section">
+            <h3>Incident timeline</h3>
+            <div className="postmortem-timeline">
+              {document.timeline.map((item, index) => (
+                <div key={`${item.at}-${index}`}>
+                  <time>{formatTime(item.at)}</time>
+                  <span>{item.actor}</span>
+                  <strong>{item.event}</strong>
+                  <p>{item.detail}</p>
+                </div>
+              ))}
+            </div>
+          </section>
+          <div className="postmortem-grid">
+            <section>
+              <h3>Recovery actions</h3>
+              <ul>{document.remediation.map((item) => <li key={item}>{item}</li>)}</ul>
+            </section>
+            <section>
+              <h3>Lessons learned</h3>
+              <ul>{document.lessons.map((item) => <li key={item}>{item}</li>)}</ul>
+            </section>
+          </div>
+          <section className="postmortem-section">
+            <h3>Action items</h3>
+            <div className="action-item-list">
+              {document.action_items.map((item) => (
+                <div key={item.title}>
+                  <span className={`severity ${item.priority.toLowerCase()}`}>{item.priority}</span>
+                  <strong>{item.title}</strong>
+                  <span>{item.owner}</span>
+                  <em>{item.status}</em>
+                </div>
+              ))}
+            </div>
+          </section>
+        </article>
+      )}
+    </section>
+  );
+}
+
 function PolicySimulator({ showToast }: { showToast: (toast: Toast) => void }) {
   const [environment, setEnvironment] = useState("production");
   const [tool, setTool] = useState("kubernetes.patch_deployment");
@@ -1594,7 +1798,7 @@ function PolicySimulator({ showToast }: { showToast: (toast: Toast) => void }) {
           <h1>Policy simulator</h1>
           <p>Preview the exact decision before an Agent intent enters the execution path.</p>
         </div>
-        <span className="version-chip">policy · 1.0.0 · active</span>
+        <span className="version-chip">policy · 1.1.0 · active</span>
       </section>
       <section className="policy-layout">
         <div className="panel policy-form">

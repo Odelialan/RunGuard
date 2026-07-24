@@ -2,32 +2,39 @@
 
 > Agentic SRE 事故响应与可信执行平台
 
-[![Version](https://img.shields.io/badge/version-1.0.0-6ef0b5)](./VERSION)
+[![Version](https://img.shields.io/badge/version-1.1.0-6ef0b5)](./VERSION)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-78aef7)](./pyproject.toml)
 [![React](https://img.shields.io/badge/React-TypeScript-78aef7)](./apps/web/package.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-ac92ff)](./LICENSE)
 
 RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行、效果验证和复盘记录连接为一条可审计的事故响应链路。LLM 只生成结构化 Tool Intent，无法直接获得基础设施凭据；所有写操作必须经过参数校验、风险分级、策略判断、幂等控制与回滚检查。
 
-当前版本：**1.0.0** · 发布日期：**2026-07-24**
+当前版本：**1.1.0** · 发布日期：**2026-07-24**
 作者：**OdeliaLan**
 
-## 1.0 能力
+## 1.1 能力
 
 - Prometheus Webhook 与人工 Incident 接入
-- Commander、Investigator、Remediation、Reporter 四类 Agent 工作流
-- 指标、日志、Kubernetes 状态、发布记录四类 Mock MCP 证据源
+- Commander、Investigator、Remediation、Reviewer、Reporter 五类 Agent 工作流
+- LangGraph 状态图与真实结构化 LLM 输出；本地可切换确定性后端
+- Prometheus、Loki、Kubernetes、GitHub 真实连接器与 Mock/Hybrid/Recorded 模式
 - 每条根因假设关联来源 URI 与 Evidence ID
-- R0—R3 风险分级和 Policy-as-Code 决策
+- 独立 OPA 服务执行 Rego 策略，OPA 异常时 fail-closed
 - 生产写操作人工审批，R3 操作默认拒绝
-- Tool Intent 幂等键、before/after snapshot 与补偿动作
-- 执行后 SLO 验证和完整 Trace 时间线
+- PostgreSQL + pgvector 证据存储、语义检索与 Redis Streams 事件总线
+- Kubernetes Job 沙箱、独立 ServiceAccount、最小 RBAC、RuntimeDefault seccomp
+- Tool Intent 幂等键、before/after snapshot、失败验证与真实补偿回滚
+- OpenTelemetry OTLP Trace，可接 Tempo/Jaeger 与 Grafana
 - append-only Incident Event 事件记录
 - Recorded MCP 重放模式，重放不产生副作用
+- A2A 1.0 Reviewer Agent Card、JSON-RPC 审查服务与远程 Reviewer Client
+- 结构化 Postmortem 页面、JSON/Markdown 导出与行动项
 - 12 个固定故障案例及可复现评测报告
-- 响应式 Incident 工作台、Approval Center、Trace Explorer、Evaluation Dashboard、Policy Simulator
+- Helm Chart、kind 三节点演示集群与可控故障注入/补偿验证脚本
+- 中英文切换、提升字号后的响应式运维工作台
 
-> 1.0 默认运行在 `simulation` 模式，不会连接或修改真实集群。
+> 默认仍运行在 `simulation + mock + deterministic` 安全模式。只有显式配置生产连接器、
+> OPA、数据库、模型和 `kubernetes_job` 执行模式后，系统才会访问真实基础设施。
 
 ## 快速开始
 
@@ -55,10 +62,30 @@ npm --prefix apps/web install
 npm --prefix apps/web run dev
 ```
 
-Docker Compose：
+完整 Docker Compose 栈（PostgreSQL/pgvector、Redis、OPA、Prometheus、Loki、
+OpenTelemetry Collector、Tempo、Grafana、RunGuard 与故障注入器）：
 
 ```bash
 docker compose up --build
+```
+
+启动后可访问 RunGuard `:5173`、Grafana `:3000`、Prometheus `:9090` 和 Fault
+Injector `:8090`。
+
+### kind 真实沙箱与失败补偿
+
+需要 Docker、kind、kubectl 和 Helm：
+
+```bash
+./scripts/kind-up.sh
+./scripts/kind-failure-demo.sh
+```
+
+失败演示会在集群内注入健康检查故障，通过受限 Kubernetes Job 修改 Deployment，在验证
+失败后执行补偿 Job，并断言 Incident 进入 `ROLLED_BACK`。完成后运行：
+
+```bash
+./scripts/kind-down.sh
 ```
 
 ### 局域网访问
@@ -105,7 +132,8 @@ flowchart LR
     C --> D["Commander"]
     C --> E["Investigator"]
     C --> F["Remediation"]
-    C --> G["Reporter"]
+    C --> G["Reviewer"]
+    C --> V["Reporter"]
     E --> H["MCP Tool Gateway"]
     F --> I["Normalized Tool Intent"]
     I --> J["Risk Classifier"]
@@ -117,12 +145,15 @@ flowchart LR
     L --> O["Verification"]
     O -->|"pass"| P["Resolved"]
     O -->|"fail"| Q["Compensation / Rollback"]
-    C -.-> R[("SQLite Event Store")]
+    C -.-> R[("PostgreSQL + pgvector")]
     H -.-> S["Prometheus / Loki / K8s / GitHub"]
-    C -.-> T["Trace + Replay + Eval"]
+    C -.-> T["Redis Streams + Replay + Eval"]
+    C -.-> U["OTLP → Tempo / Jaeger / Grafana"]
 ```
 
-1.0 使用 SQLite 实现零依赖本地演示；数据访问层保持独立，可替换为 PostgreSQL。MCP 采用 Transport 接口隔离会话式、无状态、Mock 与 Recorded 实现。
+本地安全模式继续支持 SQLite 零依赖演示；生产模式使用 Psycopg 3 连接 PostgreSQL，
+在 Evidence 表启用 pgvector，并通过 Redis Streams 输出可消费、可重放的事故事件。
+连接器采用统一 Transport 接口隔离 Production、Hybrid、Mock 与 Recorded 实现。
 
 ## 可信执行路径
 
@@ -135,7 +166,7 @@ Agent plan
   → policy decision
   → human approval when required
   → idempotency check
-  → simulated restricted execution
+  → restricted Kubernetes Job execution
   → SLO verification
   → resolve or compensate
 ```
@@ -188,14 +219,31 @@ stateDiagram-v2
 
 ## 策略决策
 
-| 风险 | 示例 | 1.0 默认策略 |
+| 风险 | 示例 | 1.1 默认策略 |
 | --- | --- | --- |
 | R0 | 查询指标、日志、Pod 状态 | 自动允许 |
 | R1 | staging Deployment 可逆修改 | 自动允许 |
 | R2 | production 写操作、无回滚写操作 | 强制审批 |
 | R3 | 删除 Namespace、数据库删除、任意 Shell | 拒绝 |
 
-策略源码位于 [`policies/runguard.rego`](./policies/runguard.rego)。没有安装 OPA 时，API 使用等价的内置确定性求值器，便于本地运行；真实部署应由独立 OPA 服务做最终决策。
+策略源码位于 [`policies/runguard.rego`](./policies/runguard.rego)。本地安全模式可使用等价
+Python 求值器；生产设置 `RUNGUARD_POLICY_BACKEND=opa` 后，独立 OPA Data API 是最终决策点，
+不可用或返回未定义结果时默认拒绝执行。
+
+## 生产配置
+
+| 配置 | 生产值 | 作用 |
+| --- | --- | --- |
+| `RUNGUARD_DATABASE_URL` | PostgreSQL DSN | 启用 PostgreSQL/pgvector |
+| `RUNGUARD_REDIS_URL` | Redis DSN | 启用 Streams 事件发布 |
+| `RUNGUARD_CONNECTOR_MODE` | `production` | 使用真实四类连接器 |
+| `RUNGUARD_AGENT_BACKEND` | `langgraph` | 使用 LangGraph 与结构化 LLM |
+| `RUNGUARD_POLICY_BACKEND` | `opa` | 使用独立 OPA |
+| `RUNGUARD_EXECUTION_MODE` | `kubernetes_job` | 使用受限 Job 执行 |
+| `RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT` | Collector HTTP 端点 | 输出 OTLP Trace |
+| `RUNGUARD_A2A_REVIEWER_URL` | A2A JSON-RPC URL | 委托独立 Reviewer |
+
+所有密钥仅通过 Secret/环境变量注入。Helm Chart 不包含真实密钥，安装时必须提供。
 
 ## 评测集
 
@@ -224,7 +272,11 @@ RunGuard/
 ├── apps/api/runguard_api/   # FastAPI、状态机、策略、事件存储、执行与评测
 ├── apps/web/                # React + TypeScript 操作台
 ├── deploy/docker/           # API 与 Web 容器配置
+├── deploy/helm/runguard/    # 生产 Helm Chart、RBAC 与安全上下文
+├── deploy/kind/             # 本地三节点集群与演示工作负载
+├── deploy/observability/    # Prometheus/Loki/Tempo/OTel/Grafana
 ├── policies/                # OPA Rego 策略
+├── services/fault-injector/ # 有鉴权的延迟/错误/健康故障注入器
 ├── scripts/                 # 本地启动入口
 ├── .github/workflows/       # CI 类型检查、构建与 API smoke test
 ├── VERSION
@@ -243,6 +295,18 @@ RunGuard/
 
 该脚本会检查 Python 静态规则、前端类型与生产构建、API smoke test、Git 追踪文件大小和常见凭据模式。
 
+## 1.1.0 发布记录
+
+**2026-07-24 · Production foundations**
+
+- 接入真实 Prometheus、Loki、Kubernetes、GitHub 数据源与 Hybrid 模式。
+- 接入 LangGraph、结构化 LLM 和 A2A Reviewer。
+- 启用 PostgreSQL/pgvector、Redis Streams、独立 OPA 与 OTLP。
+- 实现受限 Kubernetes Job、ServiceAccount、RBAC、seccomp 和补偿回滚。
+- 增加结构化 Postmortem 页面与 Markdown/JSON 导出。
+- 增加 Compose、Helm、kind、故障注入服务和真实失败补偿脚本。
+- 前端整体字号提升，并支持右上角中英文切换与偏好记忆。
+
 ## 1.0.0 发布记录
 
 **2026-07-24 · Initial release**
@@ -254,13 +318,13 @@ RunGuard/
 - 建立 12 场景确定性评测套件和可交互 Dashboard。
 - 完成响应式 Web 工作台、容器化配置、CI 与安全提交检查。
 
-## 已知限制
+## 运行边界
 
-- 默认工具与模型响应是确定性模拟，尚未连接真实 Prometheus、Loki、Kubernetes 或模型服务。
-- 事件存储使用单机 SQLite，不用于高并发或多 Worker 生产部署。
-- Rego 文件已提供，但本地 API 的等价求值器不替代生产 OPA 决策点。
-- 1.0 不提供完整企业 IAM、多集群调度、任意 Shell 或生产自动执行。
-- 自动回滚的数据模型与补偿路径已实现，演示数据默认验证成功；真实集群故障注入留给后续版本。
+- 任意 Shell、Namespace 删除、数据库删除等 R3 能力不实现，也不会通过策略。
+- 生产连接器需要提供对应端点、Token、kubeconfig/集群身份和网络连通性。
+- Helm 默认采用单集群、Namespace 级最小权限；企业 SSO、多租户和多集群调度需要按组织
+  IAM 与网络边界单独集成。
+- 未配置生产依赖时，系统明确显示 Mock/Simulation，不会把模拟数据标记成生产结果。
 
 ## License
 

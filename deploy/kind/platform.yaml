@@ -1,0 +1,231 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: runguard-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: runguard-postgres
+  namespace: runguard-system
+type: Opaque
+stringData:
+  POSTGRES_DB: runguard
+  POSTGRES_USER: runguard
+  POSTGRES_PASSWORD: runguard-kind
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: runguard-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          envFrom:
+            - secretRef: { name: runguard-postgres }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "runguard", "-d", "runguard"]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: runguard-system
+spec:
+  selector: { app: postgres }
+  ports:
+    - { name: postgres, port: 5432, targetPort: postgres }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: runguard-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      securityContext:
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          args: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+          ports:
+            - { name: redis, containerPort: 6379 }
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: runguard-system
+spec:
+  selector: { app: redis }
+  ports:
+    - { name: redis, port: 6379, targetPort: redis }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opa
+  namespace: runguard-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: opa }
+  template:
+    metadata:
+      labels: { app: opa }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: opa
+          image: openpolicyagent/opa:1.18.2-static
+          args: ["run", "--server", "--addr=0.0.0.0:8181", "/policies/runguard.rego"]
+          ports:
+            - { name: http, containerPort: 8181 }
+          volumeMounts:
+            - { name: policy, mountPath: /policies, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: policy
+          configMap: { name: runguard-policy }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opa
+  namespace: runguard-system
+spec:
+  selector: { app: opa }
+  ports:
+    - { name: http, port: 8181, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-api
+  namespace: runguard-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: order-api }
+  template:
+    metadata:
+      labels:
+        app: order-api
+        service: order-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: order-api
+          image: runguard-fault-injector:kind
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: FAULT_INJECTOR_TOKEN, value: kind-demo-token }
+          ports:
+            - { name: http, containerPort: 8090 }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-api
+  namespace: runguard-system
+spec:
+  selector: { app: order-api }
+  ports:
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fault-sentinel
+  namespace: runguard-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: fault-sentinel }
+  template:
+    metadata:
+      labels: { app: fault-sentinel }
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: fault-sentinel
+          image: runguard-fault-injector:kind
+          imagePullPolicy: IfNotPresent
+          env:
+            - { name: FAULT_INJECTOR_TOKEN, value: kind-demo-token }
+          ports:
+            - { name: http, containerPort: 8090 }
+          resources:
+            requests: { cpu: 25m, memory: 32Mi }
+            limits: { cpu: 100m, memory: 128Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fault-sentinel
+  namespace: runguard-system
+spec:
+  selector: { app: fault-sentinel }
+  ports:
+    - { name: http, port: 80, targetPort: http }

@@ -1,44 +1,64 @@
 from __future__ import annotations
 
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from .a2a import reviewer_agent_card
 from .config import load_settings
 from .engine import IncidentEngine
 from .evaluation import run_baseline
+from .event_stream import EventStream
 from .models import (
+    A2ARequest,
     ApprovalRequest,
     EvalRunRequest,
+    EvidenceSearchRequest,
     IncidentCreate,
     IncidentStatus,
     PolicySimulationRequest,
     PrometheusAlert,
     ToolIntentEdit,
 )
-from .policy import evaluate_policy
+from .postmortem import PostmortemService
 from .store import Store
+from .telemetry import Telemetry
 
 settings = load_settings()
-store = Store(settings.database_path)
-engine = IncidentEngine(store, settings)
+telemetry = Telemetry(settings.otel_endpoint, settings.otel_service_name)
+telemetry.configure()
+event_stream = EventStream(settings.redis_url, settings.redis_stream)
+store = Store(
+    settings.database_path,
+    settings.database_url,
+    seed=settings.database_seed,
+    vector_dimensions=settings.vector_dimensions,
+    telemetry=telemetry,
+)
+engine = IncidentEngine(store, settings, event_stream)
+postmortems = PostmortemService(store)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    yield
+    await event_stream.connect()
+    try:
+        yield
+    finally:
+        await event_stream.close()
 
 
 app = FastAPI(
     title="RunGuard API",
     description="Trusted Agentic SRE incident response API",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -55,11 +75,33 @@ app.add_middleware(
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "execution_mode": settings.execution_mode,
-        "database": "ready",
+        "connector_mode": settings.connector_mode,
+        "agent_backend": settings.agent_backend,
+        "policy_backend": settings.policy_backend,
+        "database": store.database_health(),
+        "database_backend": store.backend,
+        "redis_stream": "configured" if event_stream.enabled else "disabled",
+        "opentelemetry": "configured" if telemetry.endpoint else "disabled",
         "frontend": "ready" if web_index.is_file() else "not-built",
     }
+
+
+@app.get("/api/ready")
+async def readiness() -> dict[str, Any]:
+    components = {
+        "database": store.database_health(),
+        "redis": await event_stream.health(),
+        "policy": await engine.policy.health(),
+    }
+    unavailable = [name for name, status in components.items() if status == "unavailable"]
+    if unavailable:
+        raise HTTPException(
+            status_code=503,
+            detail={"status": "not-ready", "components": components},
+        )
+    return {"status": "ready", "components": components}
 
 
 @app.get("/api/overview")
@@ -67,8 +109,33 @@ def overview() -> dict[str, Any]:
     return store.overview()
 
 
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics() -> PlainTextResponse:
+    data = store.overview()
+    lines = [
+        "# HELP runguard_incidents_total Total incidents in the store.",
+        "# TYPE runguard_incidents_total gauge",
+        f"runguard_incidents_total {data['incidents']}",
+        "# HELP runguard_incidents_active Active incidents.",
+        "# TYPE runguard_incidents_active gauge",
+        f"runguard_incidents_active {data['active']}",
+        "# HELP runguard_approvals_pending Tool intents waiting for approval.",
+        "# TYPE runguard_approvals_pending gauge",
+        f"runguard_approvals_pending {data['approvals']}",
+        "# HELP runguard_trace_spans_total Recorded RunGuard spans.",
+        "# TYPE runguard_trace_spans_total gauge",
+        f"runguard_trace_spans_total {data['spans']}",
+    ]
+    for status, count in data["by_status"].items():
+        lines.append(f'runguard_incidents_by_status{{status="{status}"}} {count}')
+    return PlainTextResponse(
+        "\n".join(lines) + "\n",
+        media_type="text/plain; version=0.0.4",
+    )
+
+
 @app.post("/api/alerts/prometheus", status_code=201)
-def prometheus_alert(payload: PrometheusAlert) -> dict[str, Any]:
+async def prometheus_alert(payload: PrometheusAlert) -> dict[str, Any]:
     labels = payload.labels
     annotations = payload.annotations
     incident = IncidentCreate(
@@ -78,12 +145,39 @@ def prometheus_alert(payload: PrometheusAlert) -> dict[str, Any]:
         environment=labels.get("environment", "staging"),
         description=annotations.get("description", ""),
     )
-    return store.create_incident(incident, source="prometheus")
+    created = store.create_incident(incident, source="prometheus")
+    await event_stream.publish(
+        "incident.created",
+        created["id"],
+        {"source": "prometheus", "severity": created["severity"]},
+    )
+    return created
 
 
 @app.post("/api/incidents", status_code=201)
-def create_incident(payload: IncidentCreate) -> dict[str, Any]:
-    return store.create_incident(payload)
+async def create_incident(payload: IncidentCreate) -> dict[str, Any]:
+    created = store.create_incident(payload)
+    await event_stream.publish(
+        "incident.created",
+        created["id"],
+        {"source": "manual", "severity": created["severity"]},
+    )
+    return created
+
+
+@app.get("/api/events/stream")
+async def recent_stream_events(limit: int = Query(default=100, ge=1, le=1000)):
+    return await event_stream.recent(limit)
+
+
+@app.post("/api/evidence/search")
+async def search_evidence(payload: EvidenceSearchRequest):
+    if not engine.evidence_index.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Semantic evidence search requires PostgreSQL/pgvector and embeddings.",
+        )
+    return await engine.evidence_index.search(payload.query, payload.limit)
 
 
 @app.get("/api/incidents")
@@ -203,8 +297,8 @@ def edit_intent(intent_id: str, payload: ToolIntentEdit) -> dict[str, Any]:
 
 
 @app.post("/api/policies/simulate")
-def simulate_policy(payload: PolicySimulationRequest) -> dict[str, Any]:
-    return evaluate_policy(payload)
+async def simulate_policy(payload: PolicySimulationRequest) -> dict[str, Any]:
+    return await engine.policy.evaluate(payload)
 
 
 @app.get("/api/policies/versions")
@@ -213,7 +307,7 @@ def policy_versions() -> list[dict[str, Any]]:
         {
             "version": settings.policy_version,
             "status": "active",
-            "rules": 4,
+            "rules": 5,
             "published_at": "2026-07-24",
         }
     ]
@@ -235,7 +329,101 @@ def get_evaluation(eval_id: str) -> dict[str, Any]:
     return _not_found(store.get_eval_run, eval_id)
 
 
-web_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+@app.post("/api/incidents/{incident_id}/postmortem", status_code=201)
+def generate_postmortem(incident_id: str) -> dict[str, Any]:
+    try:
+        return postmortems.generate(incident_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Incident not found.") from None
+
+
+@app.get("/api/incidents/{incident_id}/postmortem")
+def get_postmortem(incident_id: str) -> dict[str, Any]:
+    return _not_found(store.get_postmortem, incident_id)
+
+
+@app.get("/api/incidents/{incident_id}/postmortem/export")
+def export_postmortem(
+    incident_id: str,
+    format: str = Query(default="markdown", pattern="^(markdown|json)$"),
+):
+    document = _not_found(store.get_postmortem, incident_id)
+    if format == "json":
+        return document
+    filename = f"{incident_id.lower()}-postmortem.md"
+    return PlainTextResponse(
+        postmortems.markdown(document),
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/.well-known/agent-card.json")
+def a2a_agent_card(request: Request) -> dict[str, Any]:
+    return reviewer_agent_card(str(request.base_url).rstrip("/"))
+
+
+@app.post("/a2a/reviewer")
+def a2a_reviewer(payload: A2ARequest) -> dict[str, Any]:
+    message = payload.params.get("message", {})
+    parts = message.get("parts", [])
+    data = next(
+        (part.get("data") for part in parts if isinstance(part.get("data"), dict)),
+        {},
+    )
+    remediation = data.get("remediation", {})
+    incident = data.get("incident", {})
+    tool = remediation.get("tool_name", "unknown")
+    environment = incident.get("environment", "production")
+    rollback = remediation.get("rollback", {})
+    from .policy import classify_risk
+
+    risk = classify_risk(tool, environment, remediation.get("arguments", {}))
+    if str(risk) == "R3":
+        decision = "deny"
+        reason = "R3 or arbitrary execution is outside the reviewer permission boundary."
+    elif environment in {"production", "prod"}:
+        decision = "require_human_approval"
+        reason = "The plan is bounded, but production writes require a human approver."
+    elif not rollback:
+        decision = "deny"
+        reason = "The proposed write has no compensating action."
+    else:
+        decision = "approve"
+        reason = "The change is scoped, reversible, and remains behind the policy gateway."
+    review = {"decision": decision, "reason": reason, "concerns": []}
+    task_id = f"a2a-review-{payload.id}"
+    return {
+        "jsonrpc": "2.0",
+        "id": payload.id,
+        "result": {
+            "id": task_id,
+            "contextId": message.get("contextId") or task_id,
+            "status": {
+                "state": "completed",
+                "message": {
+                    "messageId": f"{task_id}-message",
+                    "role": "agent",
+                    "parts": [{"kind": "text", "text": reason}],
+                },
+            },
+            "artifacts": [
+                {
+                    "artifactId": f"{task_id}-artifact",
+                    "name": "review-decision",
+                    "parts": [{"kind": "data", "data": review}],
+                }
+            ],
+        },
+    }
+
+
+web_dist = Path(
+    os.getenv(
+        "RUNGUARD_WEB_DIST",
+        str(Path(__file__).resolve().parents[2] / "web" / "dist"),
+    )
+)
 web_index = web_dist / "index.html"
 if web_index.is_file():
     app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="web-assets")
