@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field
+
+
+class IncidentStatus(StrEnum):
+    NEW = "NEW"
+    TRIAGING = "TRIAGING"
+    INVESTIGATING = "INVESTIGATING"
+    PLAN_READY = "PLAN_READY"
+    POLICY_CHECKING = "POLICY_CHECKING"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
+    EXECUTING = "EXECUTING"
+    VERIFYING = "VERIFYING"
+    RESOLVED = "RESOLVED"
+    DENIED = "DENIED"
+    ROLLING_BACK = "ROLLING_BACK"
+    ROLLED_BACK = "ROLLED_BACK"
+    HUMAN_HANDOFF = "HUMAN_HANDOFF"
+    CANCELLED = "CANCELLED"
+
+
+class Severity(StrEnum):
+    P0 = "P0"
+    P1 = "P1"
+    P2 = "P2"
+    P3 = "P3"
+
+
+class RiskLevel(StrEnum):
+    R0 = "R0"
+    R1 = "R1"
+    R2 = "R2"
+    R3 = "R3"
+
+
+class IncidentCreate(BaseModel):
+    title: str = Field(min_length=3, max_length=180)
+    severity: Severity = Severity.P2
+    service: str = Field(min_length=2, max_length=80)
+    environment: str = Field(default="staging", min_length=2, max_length=40)
+    description: str = Field(default="", max_length=2000)
+
+
+class PrometheusAlert(BaseModel):
+    status: str = "firing"
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    startsAt: str | None = None
+
+
+class ToolIntentCreate(BaseModel):
+    tool: str
+    actor: str = "remediation-agent"
+    incident_id: str
+    environment: str
+    resource: dict[str, Any]
+    arguments: dict[str, Any]
+    rollback: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str
+
+
+class ApprovalRequest(BaseModel):
+    reviewer: str = Field(default="SRE Operator", min_length=2, max_length=80)
+    comment: str = Field(default="", max_length=1000)
+
+
+class ToolIntentEdit(BaseModel):
+    arguments: dict[str, Any]
+    reviewer: str = Field(default="SRE Operator", min_length=2, max_length=80)
+    comment: str = Field(default="", max_length=1000)
+
+
+class PolicySimulationRequest(BaseModel):
+    agent: str = "remediation-agent"
+    role: str = "incident_remediator"
+    environment: str
+    tool: str
+    resource: str
+    risk_level: RiskLevel | None = None
+    has_rollback: bool = True
+    incident_severity: Severity = Severity.P2
+
+
+class EvalRunRequest(BaseModel):
+    suite: Literal["baseline-12"] = "baseline-12"
+    model: str = "deterministic-demo"
+    prompt_version: str = "1.0.0"

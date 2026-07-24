@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.8.3"
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install Python dependencies
+        run: uv sync --extra dev
+      - name: Python checks
+        run: |
+          uv run ruff check apps/api
+          uv run python -m compileall -q apps/api
+      - name: Install web dependencies
+        run: npm --prefix apps/web ci
+      - name: Typecheck and build web
+        run: |
+          npm --prefix apps/web run lint
+          npm --prefix apps/web run build
+      - name: API smoke test
+        run: |
+          uv run python - <<'PY'
+          from fastapi.testclient import TestClient
+          from runguard_api.main import app
+
+          client = TestClient(app)
+          assert client.get("/api/health").status_code == 200
+          assert client.get("/api/overview").status_code == 200
+          assert client.get("/api/incidents").status_code == 200
+          print("API smoke test passed")
+          PY
