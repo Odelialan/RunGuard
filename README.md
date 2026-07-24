@@ -61,6 +61,31 @@ Docker Compose：
 docker compose up --build
 ```
 
+### 局域网访问
+
+开发模式会同时监听所有网卡。启动后，使用启动日志显示的局域网地址访问：
+
+```bash
+./scripts/dev.sh
+# Web: http://<本机局域网IP>:5173
+# API: http://<本机局域网IP>:8000/docs
+```
+
+需要单端口运行时：
+
+```bash
+RUNGUARD_PORT=8000 ./scripts/serve.sh
+# 前端与 API 共用 http://<本机局域网IP>:8000
+```
+
+查看本机局域网 IP：
+
+```bash
+hostname -I
+```
+
+访问设备需要与运行 RunGuard 的电脑处于同一局域网。若系统启用了防火墙，需要允许 TCP `5173` 和 `8000`；单端口模式只需允许所选端口。不要把模拟模式以外的执行服务直接暴露到不受信任网络。
+
 ## 演示流程
 
 1. 打开 Incidents，进入一个新 Incident。

@@ -9,6 +9,7 @@ from pathlib import Path
 class Settings:
     database_path: Path
     cors_origins: tuple[str, ...]
+    cors_origin_regex: str
     execution_mode: str
     prompt_version: str
     policy_version: str
@@ -26,6 +27,14 @@ def load_settings() -> Settings:
     return Settings(
         database_path=database_path,
         cors_origins=tuple(origin.strip() for origin in origins.split(",") if origin.strip()),
+        cors_origin_regex=os.getenv(
+            "RUNGUARD_CORS_ORIGIN_REGEX",
+            (
+                r"^https?://(localhost|127\.0\.0\.1|10\.\d+\.\d+\.\d+|"
+                r"192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)"
+                r"(:\d+)?$"
+            ),
+        ),
         execution_mode=os.getenv("RUNGUARD_EXECUTION_MODE", "simulation"),
         prompt_version=os.getenv("RUNGUARD_PROMPT_VERSION", "1.0.0"),
         policy_version=os.getenv("RUNGUARD_POLICY_VERSION", "1.0.0"),

@@ -17,6 +17,7 @@ from runguard_api.main import app
 
 client = TestClient(app)
 assert client.get("/api/health").status_code == 200
+assert client.get("/").status_code == 200
 assert client.get("/api/overview").json()["incidents"] >= 4
 assert len(client.get("/api/incidents").json()) >= 4
 assert client.post(

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from .config import load_settings
 from .engine import IncidentEngine
@@ -41,6 +44,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_origins),
+    allow_origin_regex=settings.cors_origin_regex,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,6 +58,7 @@ def health() -> dict[str, Any]:
         "version": "1.0.0",
         "execution_mode": settings.execution_mode,
         "database": "ready",
+        "frontend": "ready" if web_index.is_file() else "not-built",
     }
 
 
@@ -228,6 +233,16 @@ def list_evaluations() -> list[dict[str, Any]]:
 @app.get("/api/evals/{eval_id}/report")
 def get_evaluation(eval_id: str) -> dict[str, Any]:
     return _not_found(store.get_eval_run, eval_id)
+
+
+web_dist = Path(__file__).resolve().parents[2] / "web" / "dist"
+web_index = web_dist / "index.html"
+if web_index.is_file():
+    app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="web-assets")
+
+    @app.get("/", include_in_schema=False)
+    def web_application() -> FileResponse:
+        return FileResponse(web_index)
 
 
 def _not_found(function, *args):
