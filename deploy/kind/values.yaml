@@ -15,6 +15,7 @@ service:
 
 config:
   environment: kind
+  enforceProductionGuards: false
   connectorMode: hybrid
   agentBackend: deterministic
   executionMode: kubernetes_job
@@ -27,14 +28,28 @@ config:
   redisUrl: redis://redis.runguard-system.svc:6379/0
   otelEndpoint: ""
   databaseSeed: true
+  databasePoolMinSize: 1
+  databasePoolMaxSize: 5
   embeddingsEnabled: false
   llmModel: gpt-5-mini
   verificationUrlTemplate: http://fault-sentinel.runguard-system.svc/health
+  allowedNamespaces: runguard-system
+  checkpointBackend: memory
+  autoRecover: false
+  recoveryConcurrency: 2
+  corsOrigins: http://127.0.0.1:8088
+  corsOriginRegex: ""
+
+auth:
+  mode: disabled
+  rateLimitPerMinute: 300
 
 secrets:
   databaseUrl: postgresql://runguard:runguard-kind@postgres.runguard-system.svc:5432/runguard
   openaiApiKey: kind-not-used
   githubToken: ""
+  prometheusWebhookSecret: kind-webhook-secret
+  langgraphAesKey: kind-demo-key-16
 
 autoscaling:
   enabled: false

@@ -105,6 +105,7 @@ function App() {
   const [approvals, setApprovals] = useState<ToolIntent[]>([]);
   const [traces, setTraces] = useState<TraceSpan[]>([]);
   const [evaluations, setEvaluations] = useState<EvalRun[]>([]);
+  const [authenticated, setAuthenticated] = useState(api.hasAccessToken());
   const [loading, setLoading] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -114,22 +115,34 @@ function App() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const [nextHealth, nextOverview, nextIncidents, nextApprovals, nextTraces, nextEvaluations] =
+      const nextHealth = await api.health();
+      setHealth(nextHealth);
+      if (nextHealth.authentication !== "disabled") {
+        if (!api.hasAccessToken()) {
+          setAuthenticated(false);
+          return;
+        }
+        await api.identity();
+      }
+      setAuthenticated(true);
+      const [nextOverview, nextIncidents, nextApprovals, nextTraces, nextEvaluations] =
         await Promise.all([
-          api.health(),
           api.overview(),
           api.incidents(),
           api.approvals(),
           api.traces(),
           api.evaluations(),
         ]);
-      setHealth(nextHealth);
       setOverview(nextOverview);
       setIncidents(nextIncidents);
       setApprovals(nextApprovals);
       setTraces(nextTraces);
       setEvaluations(nextEvaluations);
     } catch (error) {
+      if ((error as Error).message.toLowerCase().includes("token")) {
+        api.clearAccessToken();
+        setAuthenticated(false);
+      }
       setToast({ message: (error as Error).message, tone: "error" });
     } finally {
       setLoading(false);
@@ -181,9 +194,38 @@ function App() {
           loading={loading}
           language={language}
           onLanguageChange={() => setLanguage((current) => (current === "en" ? "zh" : "en"))}
+          onSignOut={
+            health?.authentication !== "disabled" && authenticated
+              ? () => {
+                  api.clearAccessToken();
+                  setAuthenticated(false);
+                  setOverview(null);
+                }
+              : undefined
+          }
         />
         <div className="content">
-          {loading && !overview ? (
+          {health && health.authentication !== "disabled" && !authenticated ? (
+            <AuthenticationGate
+              mode={health.authentication}
+              onAuthenticated={async (token) => {
+                api.setAccessToken(token);
+                try {
+                  const identity = await api.identity();
+                  setAuthenticated(true);
+                  setToast({
+                    message: `Authenticated as ${identity.subject}`,
+                    tone: "success",
+                  });
+                  await refresh();
+                } catch (error) {
+                  api.clearAccessToken();
+                  setAuthenticated(false);
+                  throw error;
+                }
+              }}
+            />
+          ) : loading && !overview ? (
             <LoadingState />
           ) : (
             <>
@@ -281,7 +323,7 @@ function Sidebar({
           </div>
           <div>
             <div className="brand-name">RunGuard</div>
-            <div className="brand-version">TRUSTED OPS · V1.1</div>
+            <div className="brand-version">TRUSTED OPS · V1.2</div>
           </div>
           <button className="icon-button sidebar-close" onClick={onClose}>
             <X size={19} />
@@ -334,6 +376,20 @@ function Sidebar({
               {health?.execution_mode === "kubernetes_job" ? "Kubernetes Job" : "Simulation"}
             </strong>
           </div>
+          <div className="status-row">
+            <span>Identity</span>
+            <strong>
+              {health?.authentication === "disabled"
+                ? "Local demo"
+                : health?.authentication?.toUpperCase()}
+            </strong>
+          </div>
+          <div className="status-row">
+            <span>Checkpoints</span>
+            <strong>
+              {health?.workflow_checkpoints === "postgres" ? "PostgreSQL" : "In memory"}
+            </strong>
+          </div>
         </div>
         <div className="user-row">
           <div className="avatar">OL</div>
@@ -357,6 +413,7 @@ function Header({
   loading,
   language,
   onLanguageChange,
+  onSignOut,
 }: {
   title: string;
   onMenu: () => void;
@@ -365,6 +422,7 @@ function Header({
   loading: boolean;
   language: Language;
   onLanguageChange: () => void;
+  onSignOut?: () => void;
 }) {
   return (
     <header className="topbar">
@@ -401,12 +459,75 @@ function Header({
           <i />
           <span className={language === "en" ? "active" : ""}>EN</span>
         </button>
+        {onSignOut && (
+          <button className="icon-button" onClick={onSignOut} aria-label="Sign out">
+            <KeyRound size={17} />
+          </button>
+        )}
         <button className="primary-button" onClick={onCreate}>
           <Plus size={17} />
           New incident
         </button>
       </div>
     </header>
+  );
+}
+
+function AuthenticationGate({
+  mode,
+  onAuthenticated,
+}: {
+  mode: string;
+  onAuthenticated: (token: string) => Promise<void>;
+}) {
+  const [token, setToken] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!token.trim()) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      await onAuthenticated(token.trim());
+    } catch (nextError) {
+      setError((nextError as Error).message);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <section className="authentication-gate">
+      <div className="authentication-icon">
+        <LockKeyhole size={24} />
+      </div>
+      <div>
+        <span className="eyebrow">PROTECTED WORKSPACE</span>
+        <h1>Authenticate to RunGuard</h1>
+        <p>
+          Enter a short-lived {mode === "oidc" ? "OIDC access token" : "API key"}.
+          Credentials are kept in this browser tab only.
+        </p>
+      </div>
+      <form onSubmit={submit}>
+        <label htmlFor="access-token">Access token</label>
+        <input
+          id="access-token"
+          type="password"
+          autoComplete="off"
+          value={token}
+          onChange={(event) => setToken(event.target.value)}
+          placeholder="Paste bearer token"
+        />
+        {error && <div className="form-error">{error}</div>}
+        <button className="primary-button" type="submit" disabled={submitting || !token.trim()}>
+          <KeyRound size={17} />
+          {submitting ? "Authenticating…" : "Continue securely"}
+        </button>
+      </form>
+    </section>
   );
 }
 
@@ -896,7 +1017,7 @@ function IncidentWorkspace({
         <aside className="workspace-side">
           <div className="panel run-summary">
             <PanelHeader title="Run telemetry" subtitle={latestRun?.id ?? "No run started"} />
-            <SummaryStat icon={Sparkles} label="Prompt version" value={latestRun?.prompt_version ?? "1.1.0"} />
+            <SummaryStat icon={Sparkles} label="Prompt version" value={latestRun?.prompt_version ?? "1.2.0"} />
             <SummaryStat icon={Code2} label="Tokens" value={formatNumber(latestRun?.token_usage ?? 0)} />
             <SummaryStat icon={TerminalSquare} label="Tool calls" value={String(latestRun?.tool_calls ?? 0)} />
             <SummaryStat
@@ -1798,7 +1919,7 @@ function PolicySimulator({ showToast }: { showToast: (toast: Toast) => void }) {
           <h1>Policy simulator</h1>
           <p>Preview the exact decision before an Agent intent enters the execution path.</p>
         </div>
-        <span className="version-chip">policy · 1.1.0 · active</span>
+        <span className="version-chip">policy · 1.2.0 · active</span>
       </section>
       <section className="policy-layout">
         <div className="panel policy-form">

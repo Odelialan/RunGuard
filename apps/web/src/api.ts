@@ -116,9 +116,18 @@ export type SystemHealth = {
   policy_backend: string;
   database: string;
   database_backend: string;
+  database_pool?: Record<string, number> | null;
   redis_stream: string;
   opentelemetry: string;
+  authentication: string;
+  workflow_checkpoints: string;
   frontend: string;
+};
+
+export type Identity = {
+  subject: string;
+  roles: string[];
+  auth_mode: string;
 };
 
 export type EvalRun = {
@@ -157,10 +166,12 @@ export type Postmortem = {
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const accessToken = sessionStorage.getItem("runguard-access-token");
   const response = await fetch(path, {
     ...init,
     headers: {
       "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
       ...init?.headers,
     },
   });
@@ -172,7 +183,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  hasAccessToken: () => Boolean(sessionStorage.getItem("runguard-access-token")),
+  setAccessToken: (token: string) =>
+    sessionStorage.setItem("runguard-access-token", token.trim()),
+  clearAccessToken: () => sessionStorage.removeItem("runguard-access-token"),
   health: () => request<SystemHealth>("/api/health"),
+  identity: () => request<Identity>("/api/auth/me"),
   overview: () => request<Overview>("/api/overview"),
   incidents: () => request<Incident[]>("/api/incidents"),
   incident: (id: string) => request<Incident>(`/api/incidents/${id}`),
@@ -209,7 +225,7 @@ export const api = {
       body: JSON.stringify({
         suite: "baseline-12",
         model: "deterministic-demo",
-        prompt_version: "1.1.0",
+        prompt_version: "1.2.0",
       }),
     }),
   postmortem: (incidentId: string) =>

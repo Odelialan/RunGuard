@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 import httpx
@@ -14,6 +15,10 @@ from .orchestration import LangGraphOrchestrator
 from .policy import PolicyEvaluator, classify_risk
 from .postmortem import PostmortemService
 from .store import Store
+
+
+class WorkflowLocked(ValueError):
+    pass
 
 
 class IncidentEngine:
@@ -38,8 +43,73 @@ class IncidentEngine:
             LangGraphOrchestrator(settings) if settings.agent_backend == "langgraph" else None
         )
         self._locks: dict[str, asyncio.Lock] = {}
+        self._recovery_task: asyncio.Task[None] | None = None
+
+    async def connect(self) -> None:
+        if self.orchestrator:
+            await self.orchestrator.initialize()
+        if self.settings.auto_recover:
+            self._recovery_task = asyncio.create_task(
+                self.recover_incomplete(),
+                name="runguard-workflow-recovery",
+            )
+
+    async def close(self) -> None:
+        if self._recovery_task and not self._recovery_task.done():
+            self._recovery_task.cancel()
+            try:
+                await self._recovery_task
+            except asyncio.CancelledError:
+                pass
+        self._recovery_task = None
+        if self.orchestrator:
+            await self.orchestrator.close()
+
+    async def recover_incomplete(self) -> None:
+        semaphore = asyncio.Semaphore(self.settings.recovery_concurrency)
+
+        async def recover_one(incident_id: str) -> None:
+            async with semaphore:
+                try:
+                    await self.resume(incident_id)
+                except WorkflowLocked:
+                    return
+                except Exception as exc:
+                    incident = self.store.get_incident(incident_id)
+                    run_id = incident.get("current_run_id")
+                    if run_id:
+                        self.store.add_trace(
+                            run_id,
+                            incident_id,
+                            "recovery",
+                            "workflow.resume",
+                            "recovery-controller",
+                            "ERROR",
+                            0,
+                            {"error": str(exc)},
+                        )
+                    self.store.update_status(
+                        incident_id,
+                        IncidentStatus.HUMAN_HANDOFF,
+                        "recovery-controller",
+                        {"reason": "Automatic recovery failed closed."},
+                    )
+
+        await asyncio.gather(
+            *(recover_one(incident_id) for incident_id in self.store.list_recoverable_incidents())
+        )
 
     async def start(self, incident_id: str) -> dict[str, Any]:
+        lock_name = f"incident:{incident_id}"
+        token = await self.event_stream.acquire_lock(lock_name)
+        if token is None:
+            raise WorkflowLocked("Incident workflow is already active on another worker.")
+        try:
+            return await self._start_unlocked(incident_id)
+        finally:
+            await self.event_stream.release_lock(lock_name, token)
+
+    async def _start_unlocked(self, incident_id: str) -> dict[str, Any]:
         lock = self._locks.setdefault(incident_id, asyncio.Lock())
         async with lock:
             incident = self.store.get_incident(incident_id)
@@ -50,7 +120,7 @@ class IncidentEngine:
                 incident_id,
                 self.settings.prompt_version,
                 graph_version=(
-                    "incident-response-langgraph-v1.1"
+                    "incident-response-langgraph-v1.2"
                     if self.orchestrator
                     else "incident-response-v1"
                 ),
@@ -61,6 +131,7 @@ class IncidentEngine:
                     "model": self.settings.llm_model if self.orchestrator else "demo-v1",
                 },
             )
+            self._checkpoint(run_id, incident_id, "RUN_CREATED")
             await self._transition(
                 incident_id,
                 IncidentStatus.TRIAGING,
@@ -82,6 +153,12 @@ class IncidentEngine:
             )
 
             evidence_ids = await self._collect_evidence(incident, run_id)
+            self._checkpoint(
+                run_id,
+                incident_id,
+                "EVIDENCE_COLLECTED",
+                {"evidence_ids": evidence_ids},
+            )
             graph_output: dict[str, Any] | None = None
             if self.orchestrator:
                 try:
@@ -89,6 +166,13 @@ class IncidentEngine:
                     graph_output = await self.orchestrator.run(
                         enriched,
                         enriched["evidence"],
+                        run_id,
+                    )
+                    self._checkpoint(
+                        run_id,
+                        incident_id,
+                        "LANGGRAPH_COMPLETED",
+                        await self.orchestrator.checkpoint(run_id) or {},
                     )
                 except Exception as exc:
                     self.store.add_trace(
@@ -172,6 +256,12 @@ class IncidentEngine:
                 rollback=rollback,
                 risk_level=str(risk),
             )
+            self._checkpoint(
+                run_id,
+                incident_id,
+                "INTENT_CREATED",
+                {"tool_intent_id": intent["id"]},
+            )
             await self._transition(
                 incident_id,
                 IncidentStatus.POLICY_CHECKING,
@@ -207,9 +297,20 @@ class IncidentEngine:
                 decision,
                 policy_input,
             )
+            self._checkpoint(
+                run_id,
+                incident_id,
+                "POLICY_DECIDED",
+                {
+                    "tool_intent_id": intent["id"],
+                    "decision": decision["decision"],
+                    "matched_policy": decision["matched_policy"],
+                },
+            )
 
             if decision["decision"] == "deny":
                 self.store.finish_run(run_id, "DENIED", 2860, 4)
+                self._checkpoint(run_id, incident_id, "DENIED")
                 return self.store.update_status(
                     incident_id,
                     IncidentStatus.DENIED,
@@ -228,6 +329,12 @@ class IncidentEngine:
                     {"tool_intent_id": intent["id"]},
                 )
                 self.store.finish_run(run_id, "WAITING_APPROVAL", 2860, 4)
+                self._checkpoint(
+                    run_id,
+                    incident_id,
+                    "WAITING_APPROVAL",
+                    {"tool_intent_id": intent["id"]},
+                )
                 return self.store.update_status(
                     incident_id,
                     IncidentStatus.WAITING_APPROVAL,
@@ -246,10 +353,16 @@ class IncidentEngine:
         intent = self.store.get_intent(intent_id)
         incident = self.store.get_incident(intent["incident_id"])
         if intent["status"] == "EXECUTED":
-            return incident
+            return await self._verify_and_finalize(intent, incident)
         if intent["status"] not in {"APPROVED", "PENDING"}:
             raise ValueError(f"Tool intent is not executable: {intent['status']}")
         run_id = intent["run_id"]
+        self._checkpoint(
+            run_id,
+            incident["id"],
+            "EXECUTION_STARTED",
+            {"tool_intent_id": intent_id},
+        )
         self.store.update_status(
             incident["id"],
             IncidentStatus.EXECUTING,
@@ -287,6 +400,16 @@ class IncidentEngine:
             after,
             result.duration_ms,
         )
+        self._checkpoint(
+            run_id,
+            incident["id"],
+            "EXECUTION_RECORDED",
+            {
+                "tool_intent_id": intent_id,
+                "ok": result.ok,
+                "source_uri": result.source_uri,
+            },
+        )
         self.store.add_trace(
             run_id,
             incident["id"],
@@ -299,10 +422,24 @@ class IncidentEngine:
         )
         if not result.ok:
             return await self.rollback(intent_id, "Execution Job failed.")
+        return await self._verify_and_finalize(self.store.get_intent(intent_id), incident)
+
+    async def _verify_and_finalize(
+        self,
+        intent: dict[str, Any],
+        incident: dict[str, Any],
+    ) -> dict[str, Any]:
+        run_id = intent["run_id"]
         self.store.update_status(
             incident["id"],
             IncidentStatus.VERIFYING,
             "orchestrator",
+        )
+        self._checkpoint(
+            run_id,
+            incident["id"],
+            "VERIFYING",
+            {"tool_intent_id": intent["id"]},
         )
         verification = await self._verify(incident, run_id)
         self.store.add_trace(
@@ -316,7 +453,10 @@ class IncidentEngine:
             verification,
         )
         if not verification["passed"]:
-            return await self.rollback(intent_id, "Post-change SLO verification failed.")
+            return await self.rollback(
+                intent["id"],
+                "Post-change SLO verification failed.",
+            )
         self.store.finish_run(run_id, "RESOLVED", 3298, 6)
         resolved = self.store.update_status(
             incident["id"],
@@ -326,17 +466,149 @@ class IncidentEngine:
         )
         report = await self._reporter_output(incident["id"], run_id)
         self.postmortems.generate(incident["id"], report)
+        self._checkpoint(
+            run_id,
+            incident["id"],
+            "RESOLVED",
+            {"tool_intent_id": intent["id"], "verification": verification},
+        )
         await self.event_stream.publish(
             "incident.resolved",
             incident["id"],
-            {"run_id": run_id, "tool_intent_id": intent_id},
+            {"run_id": run_id, "tool_intent_id": intent["id"]},
         )
         return resolved
+
+    async def edit_intent(
+        self,
+        intent_id: str,
+        arguments: dict[str, Any],
+        reviewer: str,
+        comment: str,
+    ) -> dict[str, Any]:
+        intent = self.store.get_intent(intent_id)
+        allowed_arguments = {
+            "kubernetes.patch_deployment": {
+                "service",
+                "namespace",
+                "name",
+                "container",
+                "memory_limit",
+                "cpu_limit",
+            },
+            "kubernetes.scale_deployment": {
+                "service",
+                "namespace",
+                "name",
+                "replicas",
+            },
+            "kubernetes.rollout_restart": {"service", "namespace", "name"},
+        }.get(intent["tool_name"])
+        if allowed_arguments is None:
+            raise ValueError("This tool does not support editable arguments.")
+        unexpected = set(arguments) - allowed_arguments
+        if unexpected:
+            raise ValueError(
+                "Unrecognized or protected arguments: " + ", ".join(sorted(unexpected))
+            )
+        normalized = dict(intent["arguments"])
+        normalized.update(arguments)
+        for field in ("service", "namespace", "name"):
+            if normalized.get(field) != intent["arguments"].get(field):
+                raise ValueError(f"Protected target field {field!r} cannot be edited.")
+        for field in ("memory_limit", "cpu_limit", "container"):
+            value = normalized.get(field)
+            if value is not None and (
+                not isinstance(value, str)
+                or len(value) > 80
+                or not re.fullmatch(r"[A-Za-z0-9_.+-]+", value)
+            ):
+                raise ValueError(f"Argument {field!r} has an invalid value.")
+        if "replicas" in normalized:
+            replicas = normalized["replicas"]
+            if (
+                not isinstance(replicas, int)
+                or isinstance(replicas, bool)
+                or not 0 <= replicas <= 100
+            ):
+                raise ValueError("replicas must be an integer between 0 and 100.")
+        updated = self.store.edit_intent(
+            intent_id,
+            normalized,
+            reviewer,
+            comment,
+        )
+        risk = classify_risk(
+            updated["tool_name"],
+            updated["environment"],
+            normalized,
+        )
+        self.store.update_intent_risk(intent_id, str(risk))
+        incident = self.store.get_incident(updated["incident_id"])
+        policy_input = PolicySimulationRequest(
+            environment=updated["environment"],
+            tool=updated["tool_name"],
+            resource=str(updated["resource"].get("name", "unknown")),
+            risk_level=risk,
+            has_rollback=bool(updated["rollback"]),
+            edited=True,
+            incident_severity=incident["severity"],
+        ).model_dump(mode="json")
+        decision = await self.policy.evaluate(policy_input)
+        if decision["decision"] == "allow":
+            decision = {
+                "decision": "require_approval",
+                "risk_level": str(risk),
+                "matched_policy": "edited-intent-requires-fresh-approval",
+                "reason": "Every edited intent requires a fresh human approval.",
+                "backend": decision.get("backend", self.settings.policy_backend),
+            }
+        self.store.record_policy(
+            intent_id,
+            self.settings.policy_version,
+            decision,
+            policy_input,
+        )
+        self._checkpoint(
+            updated["run_id"],
+            updated["incident_id"],
+            "INTENT_EDITED_AND_REEVALUATED",
+            {
+                "tool_intent_id": intent_id,
+                "reviewer": reviewer,
+                "decision": decision["decision"],
+                "matched_policy": decision["matched_policy"],
+            },
+        )
+        if decision["decision"] == "deny":
+            self.store.update_status(
+                updated["incident_id"],
+                IncidentStatus.DENIED,
+                "policy-gateway",
+                {"matched_policy": decision["matched_policy"]},
+            )
+        else:
+            self.store.update_status(
+                updated["incident_id"],
+                IncidentStatus.WAITING_APPROVAL,
+                "policy-gateway",
+                {
+                    "tool_intent_id": intent_id,
+                    "matched_policy": decision["matched_policy"],
+                },
+            )
+        return self.store.get_intent(intent_id)
 
     async def rollback(self, intent_id: str, reason: str) -> dict[str, Any]:
         intent = self.store.get_intent(intent_id)
         incident = self.store.get_incident(intent["incident_id"])
         run_id = intent["run_id"]
+        self._checkpoint(
+            run_id,
+            incident["id"],
+            "ROLLBACK_STARTED",
+            {"tool_intent_id": intent_id, "reason": reason},
+        )
         self.store.update_status(
             incident["id"],
             IncidentStatus.ROLLING_BACK,
@@ -392,12 +664,66 @@ class IncidentEngine:
         )
         report = await self._reporter_output(incident["id"], run_id)
         self.postmortems.generate(incident["id"], report)
+        self._checkpoint(
+            run_id,
+            incident["id"],
+            "ROLLED_BACK" if result.ok else "ROLLBACK_FAILED",
+            {"tool_intent_id": intent_id, "ok": result.ok, "reason": reason},
+        )
         await self.event_stream.publish(
             "incident.rollback_completed",
             incident["id"],
             {"run_id": run_id, "ok": result.ok, "reason": reason},
         )
         return updated
+
+    async def resume(self, incident_id: str) -> dict[str, Any]:
+        lock_name = f"incident:{incident_id}"
+        token = await self.event_stream.acquire_lock(lock_name)
+        if token is None:
+            raise WorkflowLocked("Incident recovery is already active on another worker.")
+        try:
+            return await self._resume_unlocked(incident_id)
+        finally:
+            await self.event_stream.release_lock(lock_name, token)
+
+    async def _resume_unlocked(self, incident_id: str) -> dict[str, Any]:
+        lock = self._locks.setdefault(incident_id, asyncio.Lock())
+        async with lock:
+            incident = self.store.get_incident(incident_id)
+            run_id = incident.get("current_run_id")
+            if not run_id:
+                should_start = True
+            else:
+                should_start = False
+            if should_start:
+                pass
+            else:
+                status = incident["status"]
+                intents = incident.get("tool_intents", [])
+                intent = intents[0] if intents else None
+                if status == "WAITING_APPROVAL":
+                    return incident
+                if status in {"EXECUTING", "VERIFYING"} and intent:
+                    return await self.execute(intent["id"])
+                if status == "ROLLING_BACK" and intent:
+                    return await self.rollback(intent["id"], "Resumed interrupted rollback.")
+                if status in {"RESOLVED", "DENIED", "ROLLED_BACK", "CANCELLED"}:
+                    return incident
+                self.store.finish_run(run_id, "SUPERSEDED", 0, 0)
+                self._checkpoint(
+                    run_id,
+                    incident_id,
+                    "SUPERSEDED_FOR_SAFE_REPLAN",
+                    {"previous_status": status},
+                )
+                self.store.update_status(
+                    incident_id,
+                    IncidentStatus.NEW,
+                    "recovery-controller",
+                    {"reason": "Resuming from the last pre-execution safe checkpoint."},
+                )
+        return await self._start_unlocked(incident_id)
 
     async def replay(self, incident_id: str) -> dict[str, Any]:
         incident = self.store.get_incident(incident_id)
@@ -442,6 +768,21 @@ class IncidentEngine:
             duration_ms,
             attributes,
         )
+        self._checkpoint(
+            run_id,
+            incident_id,
+            str(status),
+            {"actor": actor, **(attributes or {})},
+        )
+
+    def _checkpoint(
+        self,
+        run_id: str,
+        incident_id: str,
+        phase: str,
+        state: dict[str, Any] | None = None,
+    ) -> None:
+        self.store.checkpoint_workflow(run_id, incident_id, phase, state)
 
     async def _collect_evidence(
         self,
@@ -618,6 +959,8 @@ class IncidentEngine:
         )
 
     def _target_namespace(self, environment: str) -> str:
+        if environment in self.settings.kubernetes_allowed_namespaces:
+            return environment
         if environment.lower() in {
             "production",
             "prod",
@@ -628,4 +971,4 @@ class IncidentEngine:
             "test",
         }:
             return self.settings.kubernetes_namespace
-        return environment
+        return self.settings.kubernetes_namespace

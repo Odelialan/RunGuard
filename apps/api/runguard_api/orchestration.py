@@ -70,7 +70,43 @@ class LangGraphOrchestrator:
             settings.a2a_reviewer_url,
             settings.a2a_reviewer_token,
         )
-        self.graph = self._build_graph()
+        self._checkpointer_context: Any = None
+        self._checkpointer: Any = None
+        self.graph: Any = None
+        if settings.langgraph_checkpoint_backend == "memory":
+            from langgraph.checkpoint.memory import InMemorySaver
+
+            self._checkpointer = InMemorySaver()
+            self.graph = self._build_graph(self._checkpointer)
+
+    async def initialize(self) -> None:
+        if self.graph is not None:
+            return
+        if self.settings.langgraph_checkpoint_backend != "postgres":
+            raise RuntimeError("LangGraph checkpointer is not configured.")
+        from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+        serializer = None
+        if self.settings.langgraph_checkpoint_encryption_key:
+            from langgraph.checkpoint.serde.encrypted import EncryptedSerializer
+
+            serializer = EncryptedSerializer.from_pycryptodome_aes(
+                key=self.settings.langgraph_checkpoint_encryption_key.encode("utf-8")
+            )
+        self._checkpointer_context = AsyncPostgresSaver.from_conn_string(
+            self.settings.database_url,
+            serde=serializer,
+        )
+        self._checkpointer = await self._checkpointer_context.__aenter__()
+        await self._checkpointer.setup()
+        self.graph = self._build_graph(self._checkpointer)
+
+    async def close(self) -> None:
+        if self._checkpointer_context is not None:
+            await self._checkpointer_context.__aexit__(None, None, None)
+            self._checkpointer_context = None
+            self._checkpointer = None
+            self.graph = None
 
     @staticmethod
     def _load_prompts() -> dict[str, str]:
@@ -101,7 +137,7 @@ class LangGraphOrchestrator:
             ]
         )
 
-    def _build_graph(self):
+    def _build_graph(self, checkpointer: Any):
         from langgraph.graph import END, START, StateGraph
 
         async def commander(state: GraphState) -> dict[str, Any]:
@@ -174,24 +210,41 @@ class LangGraphOrchestrator:
         builder.add_edge("remediation", "reviewer")
         builder.add_edge("reviewer", "reporter")
         builder.add_edge("reporter", END)
-        return builder.compile()
+        return builder.compile(checkpointer=checkpointer)
 
     async def run(
         self,
         incident: dict[str, Any],
         evidence: list[dict[str, Any]],
+        run_id: str,
     ) -> GraphState:
+        if self.graph is None:
+            raise RuntimeError("LangGraph orchestrator has not been initialized.")
         return await self.graph.ainvoke(
             {"incident": incident, "evidence": evidence},
             {
-                "configurable": {"thread_id": incident["id"]},
+                "configurable": {"thread_id": run_id},
                 "metadata": {
                     "incident_id": incident["id"],
+                    "run_id": run_id,
                     "prompt_version": self.settings.prompt_version,
                 },
                 "recursion_limit": 12,
             },
         )
+
+    async def checkpoint(self, run_id: str) -> dict[str, Any] | None:
+        if self.graph is None:
+            return None
+        snapshot = await self.graph.aget_state({"configurable": {"thread_id": run_id}})
+        if not snapshot or not snapshot.config:
+            return None
+        return {
+            "config": snapshot.config,
+            "next": list(snapshot.next),
+            "metadata": dict(snapshot.metadata or {}),
+            "created_at": snapshot.created_at,
+        }
 
     async def generate_report(self, incident: dict[str, Any]) -> dict[str, Any]:
         result = await self._structured(

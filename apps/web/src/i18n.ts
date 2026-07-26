@@ -3,7 +3,7 @@ import { useEffect } from "react";
 export type Language = "en" | "zh";
 
 const ZH: Record<string, string> = {
-  "TRUSTED OPS · V1.1": "可信运维 · V1.1",
+  "TRUSTED OPS · V1.2": "可信运维 · V1.2",
   "Production workspace": "生产工作区",
   COMMAND: "指挥中心",
   Overview: "总览",
@@ -21,12 +21,28 @@ const ZH: Record<string, string> = {
   Enforced: "已强制执行",
   Execution: "执行",
   Simulation: "模拟模式",
+  Identity: "身份认证",
+  Checkpoints: "检查点",
+  "Local demo": "本地演示",
+  "In memory": "内存模式",
   "Platform owner": "平台所有者",
   "Search incidents": "搜索事故",
   "New incident": "新建事故",
   Refresh: "刷新",
   Notifications: "通知",
   "Close menu": "关闭菜单",
+  "Sign out": "退出登录",
+  "PROTECTED WORKSPACE": "受保护工作区",
+  "Authenticate to RunGuard": "登录 RunGuard",
+  "Access token": "访问令牌",
+  "Paste bearer token": "粘贴 Bearer Token",
+  "Authenticating…": "正在验证……",
+  "Continue securely": "安全进入",
+  "Credentials are kept in this browser tab only.": "凭据仅保存在当前浏览器标签页中。",
+  "Enter a short-lived OIDC access token. Credentials are kept in this browser tab only.":
+    "请输入短期有效的 OIDC 访问令牌。凭据仅保存在当前浏览器标签页中。",
+  "Enter a short-lived API key. Credentials are kept in this browser tab only.":
+    "请输入短期有效的 API Key。凭据仅保存在当前浏览器标签页中。",
   "Incident command, with guardrails.": "带安全护栏的事故指挥中心。",
   "Investigate faster, control every side effect, and keep a complete trail from alert to recovery.":
     "加速调查、控制每个副作用，并保留从告警到恢复的完整审计链路。",

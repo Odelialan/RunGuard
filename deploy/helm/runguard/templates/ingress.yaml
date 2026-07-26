@@ -7,11 +7,9 @@ metadata:
     {{- include "runguard.labels" . | nindent 4 }}
 spec:
   ingressClassName: {{ .Values.ingress.className }}
-  {{- if .Values.ingress.tlsSecret }}
   tls:
     - hosts: [{{ .Values.ingress.host | quote }}]
-      secretName: {{ .Values.ingress.tlsSecret }}
-  {{- end }}
+      secretName: {{ required "ingress.tlsSecret is required when ingress is enabled" .Values.ingress.tlsSecret }}
   rules:
     - host: {{ .Values.ingress.host | quote }}
       http:

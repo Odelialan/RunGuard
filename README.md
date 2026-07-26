@@ -2,26 +2,29 @@
 
 > Agentic SRE 事故响应与可信执行平台
 
-[![Version](https://img.shields.io/badge/version-1.1.0-6ef0b5)](./VERSION)
+[![Version](https://img.shields.io/badge/version-1.2.0-6ef0b5)](./VERSION)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-78aef7)](./pyproject.toml)
 [![React](https://img.shields.io/badge/React-TypeScript-78aef7)](./apps/web/package.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-ac92ff)](./LICENSE)
 
 RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行、效果验证和复盘记录连接为一条可审计的事故响应链路。LLM 只生成结构化 Tool Intent，无法直接获得基础设施凭据；所有写操作必须经过参数校验、风险分级、策略判断、幂等控制与回滚检查。
 
-当前版本：**1.1.0** · 发布日期：**2026-07-24**
+当前版本：**1.2.0** · 发布日期：**2026-07-26**
 作者：**OdeliaLan**
 
-## 1.1 能力
+## 1.2 能力
 
 - Prometheus Webhook 与人工 Incident 接入
 - Commander、Investigator、Remediation、Reviewer、Reporter 五类 Agent 工作流
 - LangGraph 状态图与真实结构化 LLM 输出；本地可切换确定性后端
 - Prometheus、Loki、Kubernetes、GitHub 真实连接器与 Mock/Hybrid/Recorded 模式
+- 官方 MCP Streamable HTTP 客户端，可连接四类独立远程 MCP Server
 - 每条根因假设关联来源 URI 与 Evidence ID
 - 独立 OPA 服务执行 Rego 策略，OPA 异常时 fail-closed
 - 生产写操作人工审批，R3 操作默认拒绝
 - PostgreSQL + pgvector 证据存储、语义检索与 Redis Streams 事件总线
+- PostgreSQL LangGraph Checkpointer、外层工作流检查点与重启自动恢复
+- Redis 分布式执行锁，防止多副本重复启动、执行或补偿
 - Kubernetes Job 沙箱、独立 ServiceAccount、最小 RBAC、RuntimeDefault seccomp
 - Tool Intent 幂等键、before/after snapshot、失败验证与真实补偿回滚
 - OpenTelemetry OTLP Trace，可接 Tempo/Jaeger 与 Grafana
@@ -32,6 +35,9 @@ RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行�
 - 12 个固定故障案例及可复现评测报告
 - Helm Chart、kind 三节点演示集群与可控故障注入/补偿验证脚本
 - 中英文切换、提升字号后的响应式运维工作台
+- API Key/OIDC 身份认证、viewer/operator/approver/service/admin RBAC
+- Redis 多副本限流、Prometheus Webhook HMAC 验签与安全响应头
+- 启动时生产配置 fail-fast，拒绝无鉴权、无 OPA、无沙箱或无持久化的伪生产配置
 
 > 默认仍运行在 `simulation + mock + deterministic` 安全模式。只有显式配置生产连接器、
 > OPA、数据库、模型和 `kubernetes_job` 执行模式后，系统才会访问真实基础设施。
@@ -237,13 +243,25 @@ Python 求值器；生产设置 `RUNGUARD_POLICY_BACKEND=opa` 后，独立 OPA D
 | `RUNGUARD_DATABASE_URL` | PostgreSQL DSN | 启用 PostgreSQL/pgvector |
 | `RUNGUARD_REDIS_URL` | Redis DSN | 启用 Streams 事件发布 |
 | `RUNGUARD_CONNECTOR_MODE` | `production` | 使用真实四类连接器 |
+| `RUNGUARD_CONNECTOR_MODE` | `mcp` | 使用远程 Streamable HTTP MCP Server |
 | `RUNGUARD_AGENT_BACKEND` | `langgraph` | 使用 LangGraph 与结构化 LLM |
+| `RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND` | `postgres` | 持久化 Graph 节点状态 |
 | `RUNGUARD_POLICY_BACKEND` | `opa` | 使用独立 OPA |
 | `RUNGUARD_EXECUTION_MODE` | `kubernetes_job` | 使用受限 Job 执行 |
 | `RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT` | Collector HTTP 端点 | 输出 OTLP Trace |
 | `RUNGUARD_A2A_REVIEWER_URL` | A2A JSON-RPC URL | 委托独立 Reviewer |
+| `RUNGUARD_AUTH_MODE` | `oidc` 或 `api_key` | 启用身份认证与 RBAC |
+| `RUNGUARD_ENFORCE_PRODUCTION_GUARDS` | `true` | 启动时强制校验生产安全基线 |
+| `RUNGUARD_AUTO_RECOVER` | `true` | 重启后恢复未完成工作流 |
 
 所有密钥仅通过 Secret/环境变量注入。Helm Chart 不包含真实密钥，安装时必须提供。
+生产集群建议预先创建 Secret，并通过 `secrets.existingSecret` 引用，避免把密钥写进
+Helm values 或发布记录。
+
+Prometheus Webhook 请求必须携带 Unix 秒时间戳 `X-RunGuard-Timestamp` 与
+`X-RunGuard-Signature`。签名内容为
+`HMAC-SHA256(secret, "<timestamp>.<raw-body>")`，请求头格式为
+`sha256=<hex-digest>`；超过五分钟的请求会被拒绝，以降低重放风险。
 
 ## 评测集
 
@@ -295,6 +313,20 @@ RunGuard/
 
 该脚本会检查 Python 静态规则、前端类型与生产构建、API smoke test、Git 追踪文件大小和常见凭据模式。
 
+## 1.2.0 发布记录
+
+**2026-07-26 · Production hardening**
+
+- 增加真实 MCP Streamable HTTP Client；远程 MCP 写操作仍强制经过本地受限 Job。
+- 增加 API Key 与 OIDC JWT 鉴权、五级 RBAC 和可信审批人身份绑定。
+- 增加 Redis 分布式执行锁与多副本固定窗口限流。
+- 增加 Prometheus Webhook HMAC-SHA256 验签、安全响应头和请求追踪 ID。
+- 增加 PostgreSQL LangGraph Checkpointer、加密状态和外层工作流检查点。
+- 增加安全恢复端点、启动自动恢复、验证续跑和幂等补偿恢复。
+- 增加带 advisory lock、checksum 防篡改的顺序数据库迁移。
+- Helm 增加生产配置 fail-fast、滚动更新、拓扑分散、Startup Probe 与 ServiceMonitor。
+- CI 在强制生产安全配置下验证 OIDC/API Key 边界、迁移、PostgreSQL、Redis 与 OPA。
+
 ## 1.1.0 发布记录
 
 **2026-07-24 · Production foundations**
@@ -322,6 +354,10 @@ RunGuard/
 
 - 任意 Shell、Namespace 删除、数据库删除等 R3 能力不实现，也不会通过策略。
 - 生产连接器需要提供对应端点、Token、kubeconfig/集群身份和网络连通性。
+- 生产模式必须配置 OIDC 或 API Key；身份提供方中的角色需映射为
+  `viewer`、`operator`、`approver`、`service` 或 `admin`。
+- 远程 MCP 模式要求四类 MCP Server 使用 Streamable HTTP，并由网络策略或 OAuth
+  保护；RunGuard 不把集群写权限交给远程 MCP Server。
 - Helm 默认采用单集群、Namespace 级最小权限；企业 SSO、多租户和多集群调度需要按组织
   IAM 与网络边界单独集成。
 - 未配置生产依赖时，系统明确显示 Mock/Simulation，不会把模拟数据标记成生产结果。

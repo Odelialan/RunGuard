@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
-from uuid import uuid4
 
 from .config import Settings
 from .gateway import ToolContext, ToolResult
@@ -69,11 +69,15 @@ class KubernetesJobExecutor:
         self._configure()
         batch = client.BatchV1Api()
         core = client.CoreV1Api()
-        suffix = uuid4().hex[:8]
-        job_name = f"runguard-{context.incident_id.lower().replace('_', '-')[-20:]}-{suffix}"
         idempotency_label = hashlib.sha256(
             context.idempotency_key.encode("utf-8")
         ).hexdigest()[:24]
+        incident_slug = re.sub(
+            r"[^a-z0-9-]+",
+            "-",
+            context.incident_id.lower(),
+        ).strip("-")[-20:] or "incident"
+        job_name = f"runguard-{incident_slug}-{idempotency_label[:16]}"
         payload = {
             "tool": spec.tool_name,
             "arguments": spec.arguments,
@@ -111,6 +115,10 @@ class KubernetesJobExecutor:
             args=["python", "-m", "runguard_api.runner"],
             env=[
                 client.V1EnvVar(name="RUNGUARD_TOOL_INTENT_JSON", value=json.dumps(payload)),
+                client.V1EnvVar(
+                    name="RUNGUARD_ALLOWED_NAMESPACES",
+                    value=",".join(self.settings.kubernetes_allowed_namespaces),
+                ),
             ],
             resources=client.V1ResourceRequirements(
                 requests={"cpu": "25m", "memory": "64Mi"},
@@ -157,7 +165,12 @@ class KubernetesJobExecutor:
         if existing:
             job_name = existing[0].metadata.name
         else:
-            batch.create_namespaced_job(self.settings.kubernetes_namespace, job)
+            try:
+                batch.create_namespaced_job(self.settings.kubernetes_namespace, job)
+            except client.ApiException as exc:
+                # Concurrent replicas converge on the deterministic Job name.
+                if exc.status != 409:
+                    raise
         deadline = time.monotonic() + self.settings.kubernetes_job_timeout_seconds
         status = "running"
         while time.monotonic() < deadline:

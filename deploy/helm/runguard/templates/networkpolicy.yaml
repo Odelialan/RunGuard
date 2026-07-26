@@ -12,7 +12,13 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
   policyTypes: ["Ingress", "Egress"]
   ingress:
-    - ports:
+    - from:
+        {{- range .Values.networkPolicy.ingressNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+      ports:
         - protocol: TCP
           port: 8000
   egress:

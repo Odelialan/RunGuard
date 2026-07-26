@@ -6,6 +6,7 @@ metadata:
     {{- include "runguard.labels" . | nindent 4 }}
 data:
   RUNGUARD_ENVIRONMENT: {{ .Values.config.environment | quote }}
+  RUNGUARD_ENFORCE_PRODUCTION_GUARDS: {{ .Values.config.enforceProductionGuards | quote }}
   RUNGUARD_CONNECTOR_MODE: {{ .Values.config.connectorMode | quote }}
   RUNGUARD_AGENT_BACKEND: {{ .Values.config.agentBackend | quote }}
   RUNGUARD_EXECUTION_MODE: {{ .Values.config.executionMode | quote }}
@@ -15,13 +16,32 @@ data:
   RUNGUARD_PROMETHEUS_URL: {{ .Values.config.prometheusUrl | quote }}
   RUNGUARD_LOKI_URL: {{ .Values.config.lokiUrl | quote }}
   RUNGUARD_GITHUB_REPOSITORY: {{ .Values.config.githubRepository | quote }}
+  RUNGUARD_MCP_PROMETHEUS_URL: {{ .Values.config.mcpPrometheusUrl | quote }}
+  RUNGUARD_MCP_LOKI_URL: {{ .Values.config.mcpLokiUrl | quote }}
+  RUNGUARD_MCP_KUBERNETES_URL: {{ .Values.config.mcpKubernetesUrl | quote }}
+  RUNGUARD_MCP_GITHUB_URL: {{ .Values.config.mcpGitHubUrl | quote }}
   RUNGUARD_A2A_REVIEWER_URL: {{ .Values.config.a2aReviewerUrl | quote }}
   RUNGUARD_REDIS_URL: {{ .Values.config.redisUrl | quote }}
   RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
   RUNGUARD_DATABASE_SEED: {{ .Values.config.databaseSeed | quote }}
+  RUNGUARD_DATABASE_POOL_MIN_SIZE: {{ .Values.config.databasePoolMinSize | quote }}
+  RUNGUARD_DATABASE_POOL_MAX_SIZE: {{ .Values.config.databasePoolMaxSize | quote }}
   RUNGUARD_EMBEDDINGS_ENABLED: {{ .Values.config.embeddingsEnabled | quote }}
   RUNGUARD_LLM_MODEL: {{ .Values.config.llmModel | quote }}
   RUNGUARD_VERIFICATION_URL_TEMPLATE: {{ .Values.config.verificationUrlTemplate | quote }}
+  RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND: {{ .Values.config.checkpointBackend | quote }}
+  RUNGUARD_AUTO_RECOVER: {{ .Values.config.autoRecover | quote }}
+  RUNGUARD_RECOVERY_CONCURRENCY: {{ .Values.config.recoveryConcurrency | quote }}
+  RUNGUARD_CORS_ORIGINS: {{ .Values.config.corsOrigins | quote }}
+  RUNGUARD_CORS_ORIGIN_REGEX: {{ .Values.config.corsOriginRegex | quote }}
+  RUNGUARD_AUTH_MODE: {{ .Values.auth.mode | quote }}
+  RUNGUARD_OIDC_ISSUER: {{ if eq .Values.auth.mode "oidc" }}{{ required "auth.oidcIssuer is required for OIDC" .Values.auth.oidcIssuer | quote }}{{ else }}""{{ end }}
+  RUNGUARD_OIDC_AUDIENCE: {{ if eq .Values.auth.mode "oidc" }}{{ required "auth.oidcAudience is required for OIDC" .Values.auth.oidcAudience | quote }}{{ else }}""{{ end }}
+  RUNGUARD_OIDC_JWKS_URL: {{ if eq .Values.auth.mode "oidc" }}{{ required "auth.oidcJwksUrl is required for OIDC" .Values.auth.oidcJwksUrl | quote }}{{ else }}""{{ end }}
+  RUNGUARD_OIDC_ALGORITHMS: {{ .Values.auth.oidcAlgorithms | quote }}
+  RUNGUARD_OIDC_ROLES_CLAIM: {{ .Values.auth.oidcRolesClaim | quote }}
+  RUNGUARD_RATE_LIMIT_PER_MINUTE: {{ .Values.auth.rateLimitPerMinute | quote }}
   RUNGUARD_KUBERNETES_NAMESPACE: {{ .Release.Namespace | quote }}
+  RUNGUARD_KUBERNETES_ALLOWED_NAMESPACES: {{ .Values.config.allowedNamespaces | default .Release.Namespace | quote }}
   RUNGUARD_KUBERNETES_SERVICE_ACCOUNT: {{ .Values.executorServiceAccount.name | quote }}
   RUNGUARD_KUBERNETES_RUNNER_IMAGE: {{ printf "%s:%s" .Values.runnerImage.repository .Values.runnerImage.tag | quote }}

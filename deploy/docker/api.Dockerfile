@@ -17,6 +17,7 @@ WORKDIR /app
 COPY pyproject.toml README.md VERSION ./
 COPY apps/api ./apps/api
 COPY agents/prompts ./agents/prompts
+COPY deploy/postgres ./deploy/postgres
 COPY --from=web-builder /web/dist ./apps/web/dist
 RUN pip install --no-cache-dir ".[production]"
 

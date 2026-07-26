@@ -6,6 +6,12 @@ metadata:
     {{- include "runguard.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "runguard.name" . }}
@@ -16,8 +22,20 @@ spec:
         {{- include "runguard.labels" . | nindent 8 }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if not .Values.secrets.existingSecret }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- end }}
     spec:
       serviceAccountName: {{ .Values.serviceAccount.name }}
+      terminationGracePeriodSeconds: 30
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "runguard.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -36,7 +54,7 @@ spec:
             - configMapRef:
                 name: {{ include "runguard.fullname" . }}
             - secretRef:
-                name: {{ include "runguard.fullname" . }}
+                name: {{ .Values.secrets.existingSecret | default (include "runguard.fullname" .) }}
           securityContext:
             allowPrivilegeEscalation: false
             privileged: false
@@ -52,6 +70,12 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
+          startupProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
           livenessProbe:
             httpGet:
               path: /api/health

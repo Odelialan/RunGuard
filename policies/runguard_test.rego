@@ -41,3 +41,15 @@ test_write_without_rollback_requires_human if {
   }
   result.decision == "require_approval"
 }
+
+test_edited_staging_write_requires_fresh_human if {
+  result := tool_intent.decision with input as {
+    "environment": "staging",
+    "tool": "kubernetes.patch_deployment",
+    "risk_level": "R1",
+    "has_rollback": true,
+    "edited": true
+  }
+  result.decision == "require_approval"
+  result.matched_policy == "edited-intent-requires-fresh-approval"
+}

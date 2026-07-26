@@ -82,13 +82,14 @@ class PolicySimulationRequest(BaseModel):
     resource: str
     risk_level: RiskLevel | None = None
     has_rollback: bool = True
+    edited: bool = False
     incident_severity: Severity = Severity.P2
 
 
 class EvalRunRequest(BaseModel):
     suite: Literal["baseline-12"] = "baseline-12"
     model: str = "deterministic-demo"
-    prompt_version: str = "1.1.0"
+    prompt_version: str = "1.2.0"
 
 
 class PostmortemActionItem(BaseModel):

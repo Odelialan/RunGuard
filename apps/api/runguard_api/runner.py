@@ -22,6 +22,14 @@ def _patch_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
     namespace = arguments["namespace"]
     name = arguments["name"]
     deployment = api.read_namespaced_deployment(name, namespace)
+    annotations = deployment.spec.template.metadata.annotations or {}
+    if annotations.get("runguard.io/last-execution") == arguments["idempotency_key"]:
+        return {
+            "before": {},
+            "after": {},
+            "resource_version": deployment.metadata.resource_version,
+            "idempotent_replay": True,
+        }
     container_name = arguments.get("container") or deployment.spec.template.spec.containers[0].name
     before: dict[str, Any] = {}
     patch: dict[str, Any] = {
@@ -62,12 +70,32 @@ def _patch_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
 def _scale_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
     namespace = arguments["namespace"]
     name = arguments["name"]
+    deployment = api.read_namespaced_deployment(name, namespace)
+    annotations = deployment.metadata.annotations or {}
+    if annotations.get("runguard.io/last-execution") == arguments["idempotency_key"]:
+        return {
+            "before": {"replicas": deployment.spec.replicas},
+            "after": {"replicas": deployment.spec.replicas},
+            "resource_version": deployment.metadata.resource_version,
+            "idempotent_replay": True,
+        }
     current = api.read_namespaced_deployment_scale(name, namespace)
     replicas = int(arguments["replicas"])
     result = api.patch_namespaced_deployment_scale(
         name,
         namespace,
         {"spec": {"replicas": replicas}},
+    )
+    api.patch_namespaced_deployment(
+        name,
+        namespace,
+        {
+            "metadata": {
+                "annotations": {
+                    "runguard.io/last-execution": arguments["idempotency_key"]
+                }
+            }
+        },
     )
     return {
         "before": {"replicas": current.spec.replicas},
@@ -81,6 +109,15 @@ def _restart_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
 
     namespace = arguments["namespace"]
     name = arguments["name"]
+    deployment = api.read_namespaced_deployment(name, namespace)
+    annotations = deployment.spec.template.metadata.annotations or {}
+    if annotations.get("runguard.io/last-execution") == arguments["idempotency_key"]:
+        return {
+            "before": {},
+            "after": {},
+            "resource_version": deployment.metadata.resource_version,
+            "idempotent_replay": True,
+        }
     restarted_at = datetime.now(UTC).isoformat()
     result = api.patch_namespaced_deployment(
         name,
@@ -89,7 +126,12 @@ def _restart_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
             "spec": {
                 "template": {
                     "metadata": {
-                        "annotations": {"kubectl.kubernetes.io/restartedAt": restarted_at}
+                        "annotations": {
+                            "kubectl.kubernetes.io/restartedAt": restarted_at,
+                            "runguard.io/last-execution": arguments[
+                                "idempotency_key"
+                            ],
+                        }
                     }
                 }
             }
@@ -110,6 +152,24 @@ def run() -> int:
         return 2
     _, api = _load_kubernetes()
     arguments = dict(payload["arguments"])
+    allowed_namespaces = {
+        item.strip()
+        for item in os.getenv("RUNGUARD_ALLOWED_NAMESPACES", "").split(",")
+        if item.strip()
+    }
+    if (
+        not allowed_namespaces
+        or arguments.get("namespace") not in allowed_namespaces
+    ):
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "Target namespace is outside the executor allowlist.",
+                }
+            )
+        )
+        return 3
     arguments["idempotency_key"] = payload["idempotency_key"]
     handlers = {
         "kubernetes.patch_deployment": _patch_deployment,

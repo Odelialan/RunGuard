@@ -71,6 +71,13 @@ def evaluate_policy(
                 "Destructive or arbitrary execution is outside the Agent permission boundary."
             ),
         }
+    if bool(data.get("edited")):
+        return {
+            "decision": "require_approval",
+            "risk_level": risk_value,
+            "matched_policy": "edited-intent-requires-fresh-approval",
+            "reason": "Every edited intent requires a fresh human approval.",
+        }
     if environment in {"production", "prod"} and risk_value in {"R1", "R2"}:
         return {
             "decision": "require_approval",

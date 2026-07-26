@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from uuid import uuid4
 
 
 class EventStream:
@@ -119,3 +120,26 @@ class EventStream:
             return "ready" if await self._client.ping() else "unavailable"
         except Exception:
             return "unavailable"
+
+    async def acquire_lock(self, resource: str, ttl_seconds: int = 300) -> str | None:
+        token = uuid4().hex
+        if self._client is None:
+            return token
+        acquired = await self._client.set(
+            f"runguard:lock:{resource}",
+            token,
+            ex=ttl_seconds,
+            nx=True,
+        )
+        return token if acquired else None
+
+    async def release_lock(self, resource: str, token: str) -> None:
+        if self._client is None:
+            return
+        script = """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+          return redis.call('DEL', KEYS[1])
+        end
+        return 0
+        """
+        await self._client.eval(script, 1, f"runguard:lock:{resource}", token)

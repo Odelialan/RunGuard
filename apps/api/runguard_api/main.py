@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from .a2a import reviewer_agent_card
-from .config import load_settings
+from .config import load_settings, validate_settings
 from .engine import IncidentEngine
 from .evaluation import run_baseline
 from .event_stream import EventStream
@@ -28,10 +28,17 @@ from .models import (
     ToolIntentEdit,
 )
 from .postmortem import PostmortemService
+from .security import (
+    SecurityManager,
+    SecurityMiddleware,
+    request_actor,
+    verify_webhook_signature,
+)
 from .store import Store
 from .telemetry import Telemetry
 
 settings = load_settings()
+validate_settings(settings)
 telemetry = Telemetry(settings.otel_endpoint, settings.otel_service_name)
 telemetry.configure()
 event_stream = EventStream(settings.redis_url, settings.redis_stream)
@@ -40,27 +47,39 @@ store = Store(
     settings.database_url,
     seed=settings.database_seed,
     vector_dimensions=settings.vector_dimensions,
+    database_pool_min_size=settings.database_pool_min_size,
+    database_pool_max_size=settings.database_pool_max_size,
     telemetry=telemetry,
 )
 engine = IncidentEngine(store, settings, event_stream)
 postmortems = PostmortemService(store)
+security = SecurityManager(settings)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await event_stream.connect()
     try:
+        await event_stream.connect()
+        await security.connect()
+        await engine.connect()
         yield
     finally:
+        await engine.close()
+        await security.close()
         await event_stream.close()
+        store.close()
 
 
 app = FastAPI(
     title="RunGuard API",
     description="Trusted Agentic SRE incident response API",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
+    docs_url=None if settings.enforce_production_guards else "/docs",
+    redoc_url=None if settings.enforce_production_guards else "/redoc",
+    openapi_url=None if settings.enforce_production_guards else "/openapi.json",
 )
+app.add_middleware(SecurityMiddleware, manager=security)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=list(settings.cors_origins),
@@ -75,15 +94,18 @@ app.add_middleware(
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "execution_mode": settings.execution_mode,
         "connector_mode": settings.connector_mode,
         "agent_backend": settings.agent_backend,
         "policy_backend": settings.policy_backend,
         "database": store.database_health(),
         "database_backend": store.backend,
+        "database_pool": store.database_pool_stats(),
         "redis_stream": "configured" if event_stream.enabled else "disabled",
         "opentelemetry": "configured" if telemetry.endpoint else "disabled",
+        "authentication": settings.auth_mode,
+        "workflow_checkpoints": settings.langgraph_checkpoint_backend,
         "frontend": "ready" if web_index.is_file() else "not-built",
     }
 
@@ -94,6 +116,14 @@ async def readiness() -> dict[str, Any]:
         "database": store.database_health(),
         "redis": await event_stream.health(),
         "policy": await engine.policy.health(),
+        "authentication": (
+            "disabled" if settings.auth_mode == "disabled" else "ready"
+        ),
+        "workflow_checkpoints": (
+            "ready"
+            if not engine.orchestrator or engine.orchestrator.graph is not None
+            else "unavailable"
+        ),
     }
     unavailable = [name for name, status in components.items() if status == "unavailable"]
     if unavailable:
@@ -107,6 +137,16 @@ async def readiness() -> dict[str, Any]:
 @app.get("/api/overview")
 def overview() -> dict[str, Any]:
     return store.overview()
+
+
+@app.get("/api/auth/me")
+def authenticated_identity(request: Request) -> dict[str, Any]:
+    context = request.state.auth
+    return {
+        "subject": context.subject,
+        "roles": sorted(context.roles),
+        "auth_mode": context.auth_mode,
+    }
 
 
 @app.get("/metrics", include_in_schema=False)
@@ -128,6 +168,9 @@ def prometheus_metrics() -> PlainTextResponse:
     ]
     for status, count in data["by_status"].items():
         lines.append(f'runguard_incidents_by_status{{status="{status}"}} {count}')
+    pool_stats = store.database_pool_stats() or {}
+    for name, value in pool_stats.items():
+        lines.append(f'runguard_database_{name} {value}')
     return PlainTextResponse(
         "\n".join(lines) + "\n",
         media_type="text/plain; version=0.0.4",
@@ -135,7 +178,21 @@ def prometheus_metrics() -> PlainTextResponse:
 
 
 @app.post("/api/alerts/prometheus", status_code=201)
-async def prometheus_alert(payload: PrometheusAlert) -> dict[str, Any]:
+async def prometheus_alert(
+    request: Request,
+    payload: PrometheusAlert,
+    x_runguard_signature: str | None = Header(default=None),
+    x_runguard_timestamp: str | None = Header(default=None),
+) -> dict[str, Any]:
+    try:
+        verify_webhook_signature(
+            settings.prometheus_webhook_secret,
+            await request.body(),
+            x_runguard_signature,
+            x_runguard_timestamp,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
     labels = payload.labels
     annotations = payload.annotations
     incident = IncidentCreate(
@@ -155,8 +212,11 @@ async def prometheus_alert(payload: PrometheusAlert) -> dict[str, Any]:
 
 
 @app.post("/api/incidents", status_code=201)
-async def create_incident(payload: IncidentCreate) -> dict[str, Any]:
-    created = store.create_incident(payload)
+async def create_incident(request: Request, payload: IncidentCreate) -> dict[str, Any]:
+    created = store.create_incident(
+        payload,
+        source=f"manual:{request_actor(request, 'human-operator')}",
+    )
     await event_stream.publish(
         "incident.created",
         created["id"],
@@ -196,25 +256,37 @@ async def start_incident(incident_id: str) -> dict[str, Any]:
         return await engine.start(incident_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Incident not found.") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/incidents/{incident_id}/resume")
+async def resume_incident(incident_id: str) -> dict[str, Any]:
+    try:
+        return await engine.resume(incident_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Incident not found.") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/incidents/{incident_id}/cancel")
-def cancel_incident(incident_id: str) -> dict[str, Any]:
+def cancel_incident(request: Request, incident_id: str) -> dict[str, Any]:
     return _not_found(
         store.update_status,
         incident_id,
         IncidentStatus.CANCELLED,
-        "human-operator",
+        request_actor(request, "human-operator"),
     )
 
 
 @app.post("/api/incidents/{incident_id}/handoff")
-def handoff_incident(incident_id: str) -> dict[str, Any]:
+def handoff_incident(request: Request, incident_id: str) -> dict[str, Any]:
     return _not_found(
         store.update_status,
         incident_id,
         IncidentStatus.HUMAN_HANDOFF,
-        "human-operator",
+        request_actor(request, "human-operator"),
     )
 
 
@@ -231,6 +303,17 @@ async def replay_incident(incident_id: str) -> dict[str, Any]:
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str) -> dict[str, Any]:
     return _not_found(store.get_run, run_id)
+
+
+@app.get("/api/runs/{run_id}/checkpoints")
+def get_checkpoints(run_id: str) -> list[dict[str, Any]]:
+    _not_found(store.get_run, run_id)
+    return store.list_workflow_checkpoints(run_id)
+
+
+@app.get("/api/tools")
+async def list_tools() -> list[dict[str, Any]]:
+    return await engine.transport.list_tools()
 
 
 @app.get("/api/runs/{run_id}/events")
@@ -250,11 +333,16 @@ def list_approvals() -> list[dict[str, Any]]:
 
 
 @app.post("/api/tool-intents/{intent_id}/approve")
-async def approve_intent(intent_id: str, payload: ApprovalRequest) -> dict[str, Any]:
+async def approve_intent(
+    request: Request,
+    intent_id: str,
+    payload: ApprovalRequest,
+) -> dict[str, Any]:
+    reviewer = request_actor(request, payload.reviewer)
     try:
         store.decide_approval(
             intent_id,
-            payload.reviewer,
+            reviewer,
             "approved",
             payload.comment,
         )
@@ -266,34 +354,49 @@ async def approve_intent(intent_id: str, payload: ApprovalRequest) -> dict[str, 
 
 
 @app.post("/api/tool-intents/{intent_id}/reject")
-def reject_intent(intent_id: str, payload: ApprovalRequest) -> dict[str, Any]:
+def reject_intent(
+    request: Request,
+    intent_id: str,
+    payload: ApprovalRequest,
+) -> dict[str, Any]:
+    reviewer = request_actor(request, payload.reviewer)
     try:
         intent = store.decide_approval(
             intent_id,
-            payload.reviewer,
+            reviewer,
             "rejected",
             payload.comment,
         )
         store.update_status(
             intent["incident_id"],
             IncidentStatus.HUMAN_HANDOFF,
-            payload.reviewer,
+            reviewer,
             {"reason": "remediation rejected"},
         )
         return intent
     except KeyError:
         raise HTTPException(status_code=404, detail="Tool intent not found.") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/tool-intents/{intent_id}/edit")
-def edit_intent(intent_id: str, payload: ToolIntentEdit) -> dict[str, Any]:
-    return _not_found(
-        store.edit_intent,
-        intent_id,
-        payload.arguments,
-        payload.reviewer,
-        payload.comment,
-    )
+async def edit_intent(
+    request: Request,
+    intent_id: str,
+    payload: ToolIntentEdit,
+) -> dict[str, Any]:
+    try:
+        return await engine.edit_intent(
+            intent_id,
+            payload.arguments,
+            request_actor(request, payload.reviewer),
+            payload.comment,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Tool intent not found.") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/policies/simulate")
@@ -364,7 +467,7 @@ def a2a_agent_card(request: Request) -> dict[str, Any]:
 
 
 @app.post("/a2a/reviewer")
-def a2a_reviewer(payload: A2ARequest) -> dict[str, Any]:
+def a2a_reviewer(request: Request, payload: A2ARequest) -> dict[str, Any]:
     message = payload.params.get("message", {})
     parts = message.get("parts", [])
     data = next(
@@ -425,8 +528,15 @@ web_dist = Path(
     )
 )
 web_index = web_dist / "index.html"
+web_favicon = web_dist / "favicon.svg"
 if web_index.is_file():
     app.mount("/assets", StaticFiles(directory=web_dist / "assets"), name="web-assets")
+
+    if web_favicon.is_file():
+
+        @app.get("/favicon.svg", include_in_schema=False)
+        def web_favicon_asset() -> FileResponse:
+            return FileResponse(web_favicon, media_type="image/svg+xml")
 
     @app.get("/", include_in_schema=False)
     def web_application() -> FileResponse:

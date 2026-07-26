@@ -28,7 +28,7 @@ requests_total = Counter("fault_injector_requests_total", "Requests", ["outcome"
 latency = Histogram("fault_injector_request_duration_seconds", "Injected request duration")
 fault_active = Gauge("fault_injector_active", "Whether a fault is active", ["fault"])
 
-app = FastAPI(title="RunGuard Fault Injector", version="1.1.0")
+app = FastAPI(title="RunGuard Fault Injector", version="1.2.0")
 
 
 def _authorize(token: str | None) -> None:

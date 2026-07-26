@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -427,7 +428,152 @@ class HybridMCPTransport(ProductionMCPTransport):
         return await self.mock.call_tool(tool_name, arguments, context)
 
 
+class StreamableHTTPMCPTransport:
+    """Calls remote MCP servers over the protocol's Streamable HTTP transport.
+
+    Infrastructure writes remain delegated to RunGuard's restricted Kubernetes Job
+    executor so a remote MCP server can never bypass the local policy and sandbox boundary.
+    """
+
+    TOOL_SERVERS = {
+        "prometheus.": "prometheus",
+        "loki.": "loki",
+        "kubernetes.": "kubernetes",
+        "github.": "github",
+    }
+    WRITE_TOOLS = {
+        "kubernetes.patch_deployment",
+        "kubernetes.scale_deployment",
+        "kubernetes.rollout_restart",
+    }
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.production = ProductionMCPTransport(settings)
+        self.servers = {
+            "prometheus": (
+                settings.mcp_prometheus_url,
+                settings.mcp_prometheus_token,
+            ),
+            "loki": (settings.mcp_loki_url, settings.mcp_loki_token),
+            "kubernetes": (
+                settings.mcp_kubernetes_url,
+                settings.mcp_kubernetes_token,
+            ),
+            "github": (settings.mcp_github_url, settings.mcp_github_token),
+        }
+
+    async def list_tools(self) -> list[dict[str, Any]]:
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+
+        discovered: list[dict[str, Any]] = []
+        for server_name, (url, token) in self.servers.items():
+            if not url:
+                continue
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
+                async with streamable_http_client(url, http_client=client) as streams:
+                    async with ClientSession(streams[0], streams[1]) as session:
+                        await session.initialize()
+                        tools = await session.list_tools()
+            discovered.extend(
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "backend": f"mcp-streamable-http:{server_name}",
+                    "write": tool.name in self.WRITE_TOOLS,
+                }
+                for tool in tools.tools
+            )
+        return discovered
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        if tool_name in self.WRITE_TOOLS:
+            return await self.production.call_tool(tool_name, arguments, context)
+        server_name = next(
+            (name for prefix, name in self.TOOL_SERVERS.items() if tool_name.startswith(prefix)),
+            None,
+        )
+        if not server_name:
+            return ToolResult(
+                False,
+                {"error": f"No MCP server mapping exists for {tool_name!r}."},
+                "mcp://unmapped/error",
+                0,
+            )
+        url, token = self.servers[server_name]
+        if not url:
+            return ToolResult(
+                False,
+                {"error": f"The {server_name} MCP server URL is not configured."},
+                f"mcp://{server_name}/unavailable",
+                0,
+            )
+        return await self._call_remote(url, token, server_name, tool_name, arguments)
+
+    async def rollback(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        return await self.production.rollback(tool_name, arguments, context)
+
+    @staticmethod
+    async def _call_remote(
+        url: str,
+        token: str | None,
+        server_name: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> ToolResult:
+        from mcp import ClientSession, types
+        from mcp.client.streamable_http import streamable_http_client
+
+        started = time.perf_counter()
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            async with httpx.AsyncClient(headers=headers, timeout=30.0) as client:
+                async with streamable_http_client(url, http_client=client) as streams:
+                    async with ClientSession(streams[0], streams[1]) as session:
+                        await session.initialize()
+                        result = await session.call_tool(tool_name, arguments=arguments)
+            data = result.structuredContent
+            if not isinstance(data, dict):
+                texts = [
+                    block.text
+                    for block in result.content
+                    if isinstance(block, types.TextContent)
+                ]
+                try:
+                    parsed = json.loads(texts[0]) if len(texts) == 1 else None
+                except json.JSONDecodeError:
+                    parsed = None
+                data = parsed if isinstance(parsed, dict) else {"content": texts}
+            return ToolResult(
+                ok=not bool(result.isError),
+                data=data,
+                source_uri=f"mcp+http://{server_name}/{tool_name}",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+        except Exception as exc:
+            return ToolResult(
+                ok=False,
+                data={"error": str(exc), "tool": tool_name},
+                source_uri=f"mcp+http://{server_name}/{tool_name}/error",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+
+
 def build_transport(settings: Settings) -> MCPTransport:
+    if settings.connector_mode == "mcp":
+        return StreamableHTTPMCPTransport(settings)
     if settings.connector_mode == "production":
         return ProductionMCPTransport(settings)
     if settings.connector_mode == "hybrid":

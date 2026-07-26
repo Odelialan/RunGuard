@@ -20,6 +20,12 @@ decision := {
   input.tool in r3_tools
 } else := {
   "decision": "require_approval",
+  "matched_policy": "edited-intent-requires-fresh-approval",
+  "reason": "Every edited intent requires a fresh human approval."
+} if {
+  input.edited == true
+} else := {
+  "decision": "require_approval",
   "matched_policy": "prod-write-requires-human",
   "reason": "Production write operation requires SRE approval."
 } if {

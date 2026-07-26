@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -23,15 +24,12 @@ def json_dumps(value: Any) -> str:
 
 
 class _PostgresConnection:
-    def __init__(self, database_url: str) -> None:
-        self.database_url = database_url
+    def __init__(self, pool: Any) -> None:
+        self.pool = pool
         self.raw: Any = None
 
     def __enter__(self) -> _PostgresConnection:
-        import psycopg
-        from psycopg.rows import dict_row
-
-        self.raw = psycopg.connect(self.database_url, row_factory=dict_row)
+        self.raw = self.pool.getconn()
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -39,7 +37,7 @@ class _PostgresConnection:
             self.raw.commit()
         else:
             self.raw.rollback()
-        self.raw.close()
+        self.pool.putconn(self.raw)
 
     @staticmethod
     def _query(query: str, parameters: Any) -> str:
@@ -65,6 +63,8 @@ class Store:
         *,
         seed: bool = True,
         vector_dimensions: int = 1536,
+        database_pool_min_size: int = 2,
+        database_pool_max_size: int = 20,
         telemetry: Telemetry | None = None,
     ) -> None:
         self.database_path = database_path
@@ -73,6 +73,20 @@ class Store:
         self.seed = seed
         self.vector_dimensions = vector_dimensions
         self.telemetry = telemetry
+        self._pool: Any = None
+        if database_url:
+            from psycopg.rows import dict_row
+            from psycopg_pool import ConnectionPool
+
+            self._pool = ConnectionPool(
+                database_url,
+                min_size=database_pool_min_size,
+                max_size=database_pool_max_size,
+                kwargs={"row_factory": dict_row},
+                check=ConnectionPool.check_connection,
+                open=True,
+                name="runguard-store",
+            )
         if not database_url:
             self.database_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -80,12 +94,16 @@ class Store:
 
     def connect(self) -> sqlite3.Connection | _PostgresConnection:
         if self.database_url:
-            return _PostgresConnection(self.database_url)
+            return _PostgresConnection(self._pool)
         connection = sqlite3.connect(self.database_path, timeout=30, check_same_thread=False)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         return connection
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.close()
 
     def _initialize(self) -> None:
         schema = """
@@ -225,6 +243,17 @@ class Store:
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS workflow_checkpoints (
+            id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL REFERENCES agent_runs(id),
+            incident_id TEXT NOT NULL REFERENCES incidents(id),
+            phase TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(run_id, phase)
+        );
+        CREATE INDEX IF NOT EXISTS workflow_checkpoints_incident_created_idx
+            ON workflow_checkpoints (incident_id, created_at);
         """
         with self._lock, self.connect() as connection:
             if self.backend == "postgresql":
@@ -242,10 +271,59 @@ class Store:
                     WHERE embedding IS NOT NULL
                     """
                 )
+                self._apply_postgres_migrations(connection)
             count_row = connection.execute("SELECT COUNT(*) AS count FROM incidents").fetchone()
             count = count_row["count"] if isinstance(count_row, dict) else count_row[0]
             if count == 0 and self.seed:
                 self._seed(connection)
+
+    @staticmethod
+    def _apply_postgres_migrations(connection: _PostgresConnection) -> None:
+        migrations_dir = Path(
+            os.getenv("RUNGUARD_MIGRATIONS_DIR")
+            or str(Path(__file__).resolve().parents[3] / "deploy" / "postgres")
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                version TEXT PRIMARY KEY,
+                checksum TEXT NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        connection.execute("SELECT pg_advisory_xact_lock(2026072401)")
+        if not migrations_dir.is_dir():
+            return
+        import hashlib
+
+        for path in sorted(migrations_dir.glob("*.sql")):
+            version = path.name
+            script = path.read_text(encoding="utf-8")
+            checksum = hashlib.sha256(script.encode("utf-8")).hexdigest()
+            existing = connection.execute(
+                "SELECT checksum FROM schema_migrations WHERE version = ?",
+                (version,),
+            ).fetchone()
+            if existing:
+                if existing["checksum"] != checksum:
+                    raise RuntimeError(
+                        f"Applied migration {version} has been modified; refusing startup."
+                    )
+                continue
+            transactional_script = re.sub(
+                r"(?im)^\s*(BEGIN|COMMIT)\s*;\s*$",
+                "",
+                script,
+            )
+            connection.executescript(transactional_script)
+            connection.execute(
+                """
+                INSERT INTO schema_migrations (version, checksum)
+                VALUES (?, ?)
+                """,
+                (version, checksum),
+            )
 
     def _next_incident_id(self, connection: Any) -> str:
         if self.backend == "postgresql":
@@ -673,7 +751,11 @@ class Store:
                     """
                     SELECT ti.*, pd.decision AS policy_decision, pd.matched_rule, pd.reason
                     FROM tool_intents ti
-                    LEFT JOIN policy_decisions pd ON pd.tool_intent_id = ti.id
+                    LEFT JOIN policy_decisions pd ON pd.id = (
+                        SELECT latest.id FROM policy_decisions latest
+                        WHERE latest.tool_intent_id = ti.id
+                        ORDER BY latest.created_at DESC LIMIT 1
+                    )
                     WHERE ti.incident_id = ? ORDER BY ti.created_at DESC
                     """,
                     (incident_id,),
@@ -883,6 +965,28 @@ class Store:
                 (idempotency_key,),
             ).fetchone()
             if existing:
+                if existing["status"] not in {"EXECUTED", "ROLLED_BACK"}:
+                    connection.execute(
+                        """
+                        UPDATE tool_intents
+                        SET run_id = ?, resource = ?, arguments = ?, rollback = ?,
+                            risk_level = ?, status = 'PENDING', created_at = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            run_id,
+                            json_dumps(resource),
+                            json_dumps(arguments),
+                            json_dumps(rollback),
+                            risk_level,
+                            utc_now(),
+                            existing["id"],
+                        ),
+                    )
+                    existing = connection.execute(
+                        "SELECT * FROM tool_intents WHERE id = ?",
+                        (existing["id"],),
+                    ).fetchone()
                 return self._decode(existing, "resource", "arguments", "rollback")
             connection.execute(
                 """
@@ -952,7 +1056,11 @@ class Store:
                        pd.matched_rule, pd.reason, pd.input_snapshot
                 FROM tool_intents ti
                 JOIN incidents i ON i.id = ti.incident_id
-                JOIN policy_decisions pd ON pd.tool_intent_id = ti.id
+                JOIN policy_decisions pd ON pd.id = (
+                    SELECT latest.id FROM policy_decisions latest
+                    WHERE latest.tool_intent_id = ti.id
+                    ORDER BY latest.created_at DESC LIMIT 1
+                )
                 WHERE ti.status = 'WAITING_APPROVAL'
                 ORDER BY ti.created_at DESC
                 """
@@ -974,7 +1082,11 @@ class Store:
                 """
                 SELECT ti.*, pd.decision, pd.matched_rule, pd.reason
                 FROM tool_intents ti
-                LEFT JOIN policy_decisions pd ON pd.tool_intent_id = ti.id
+                LEFT JOIN policy_decisions pd ON pd.id = (
+                    SELECT latest.id FROM policy_decisions latest
+                    WHERE latest.tool_intent_id = ti.id
+                    ORDER BY latest.created_at DESC LIMIT 1
+                )
                 WHERE ti.id = ?
                 """,
                 (intent_id,),
@@ -993,14 +1105,29 @@ class Store:
         status = "APPROVED" if decision == "approved" else "REJECTED"
         with self._lock, self.connect() as connection:
             row = connection.execute(
-                "SELECT incident_id FROM tool_intents WHERE id = ?", (intent_id,)
+                "SELECT incident_id, status FROM tool_intents WHERE id = ?", (intent_id,)
             ).fetchone()
             if not row:
                 raise KeyError(intent_id)
-            connection.execute(
-                "UPDATE tool_intents SET status = ? WHERE id = ?",
-                (status, intent_id),
+            automatic = (
+                decision == "approved"
+                and reviewer == "policy-gateway"
+                and row["status"] == "APPROVED"
             )
+            if row["status"] != "WAITING_APPROVAL" and not automatic:
+                raise ValueError(
+                    f"Tool intent is not awaiting approval: {row['status']}"
+                )
+            if not automatic:
+                updated = connection.execute(
+                    """
+                    UPDATE tool_intents SET status = ?
+                    WHERE id = ? AND status = 'WAITING_APPROVAL'
+                    """,
+                    (status, intent_id),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError("Tool intent approval was decided concurrently.")
             connection.execute(
                 "INSERT INTO approvals VALUES (?, ?, ?, ?, ?, ?)",
                 (
@@ -1034,9 +1161,42 @@ class Store:
             ).fetchone()
             if not row:
                 raise KeyError(intent_id)
-            connection.execute(
-                "UPDATE tool_intents SET arguments = ?, status = 'WAITING_APPROVAL' WHERE id = ?",
+            current = connection.execute(
+                "SELECT status FROM tool_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            if current["status"] != "WAITING_APPROVAL":
+                raise ValueError(
+                    f"Tool intent is not editable: {current['status']}"
+                )
+            updated = connection.execute(
+                """
+                UPDATE tool_intents SET arguments = ?, status = 'PENDING'
+                WHERE id = ? AND status = 'WAITING_APPROVAL'
+                """,
                 (json_dumps(arguments), intent_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError("Tool intent was edited or approved concurrently.")
+            now = utc_now()
+            connection.execute(
+                """
+                UPDATE incidents SET status = 'POLICY_CHECKING', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, row["incident_id"]),
+            )
+            self._append_event_tx(
+                connection,
+                row["incident_id"],
+                "incident.status_changed",
+                reviewer,
+                {
+                    "from": "WAITING_APPROVAL",
+                    "to": "POLICY_CHECKING",
+                    "reason": "Edited intent requires policy reevaluation.",
+                },
+                now,
             )
             self._append_event_tx(
                 connection,
@@ -1046,6 +1206,13 @@ class Store:
                 {"tool_intent_id": intent_id, "comment": comment},
             )
         return self.get_intent(intent_id)
+
+    def update_intent_risk(self, intent_id: str, risk_level: str) -> None:
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                "UPDATE tool_intents SET risk_level = ? WHERE id = ?",
+                (risk_level, intent_id),
+            )
 
     def record_execution(
         self,
@@ -1244,6 +1411,23 @@ class Store:
         except Exception:
             return "unavailable"
 
+    def database_pool_stats(self) -> dict[str, int] | None:
+        if self._pool is None:
+            return None
+        stats = self._pool.get_stats()
+        allowed = {
+            "pool_min",
+            "pool_max",
+            "pool_size",
+            "pool_available",
+            "requests_waiting",
+        }
+        return {
+            key: int(value)
+            for key, value in stats.items()
+            if key in allowed
+        }
+
     def finish_run(
         self,
         run_id: str,
@@ -1261,6 +1445,77 @@ class Store:
                 """,
                 (status, token_usage, tool_calls, status, utc_now(), run_id),
             )
+
+    def checkpoint_workflow(
+        self,
+        run_id: str,
+        incident_id: str,
+        phase: str,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        checkpoint = {
+            "id": f"CHK-{uuid4().hex[:10].upper()}",
+            "run_id": run_id,
+            "incident_id": incident_id,
+            "phase": phase,
+            "state": state or {},
+            "created_at": utc_now(),
+        }
+        with self._lock, self.connect() as connection:
+            connection.execute(
+                "DELETE FROM workflow_checkpoints WHERE run_id = ? AND phase = ?",
+                (run_id, phase),
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_checkpoints
+                    (id, run_id, incident_id, phase, state, created_at)
+                VALUES (:id, :run_id, :incident_id, :phase, :state, :created_at)
+                """,
+                {**checkpoint, "state": json_dumps(checkpoint["state"])},
+            )
+        return checkpoint
+
+    def list_workflow_checkpoints(self, run_id: str) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM workflow_checkpoints
+                WHERE run_id = ? ORDER BY created_at
+                """,
+                (run_id,),
+            ).fetchall()
+        return [self._decode(row, "state") for row in rows]
+
+    def latest_workflow_checkpoint(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM workflow_checkpoints
+                WHERE run_id = ? ORDER BY created_at DESC LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+        return self._decode(row, "state") if row else None
+
+    def list_recoverable_incidents(self) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id FROM incidents
+                WHERE status IN (
+                    'TRIAGING',
+                    'INVESTIGATING',
+                    'PLAN_READY',
+                    'POLICY_CHECKING',
+                    'EXECUTING',
+                    'VERIFYING',
+                    'ROLLING_BACK'
+                )
+                ORDER BY updated_at
+                """
+            ).fetchall()
+        return [row["id"] for row in rows]
 
     def list_traces(self, run_id: str | None = None) -> list[dict[str, Any]]:
         with self.connect() as connection:
@@ -1295,6 +1550,16 @@ class Store:
                 self._decode(row, "attributes")
                 for row in connection.execute(
                     "SELECT * FROM trace_spans WHERE run_id = ? ORDER BY created_at",
+                    (run_id,),
+                ).fetchall()
+            ]
+            result["checkpoints"] = [
+                self._decode(row, "state")
+                for row in connection.execute(
+                    """
+                    SELECT * FROM workflow_checkpoints
+                    WHERE run_id = ? ORDER BY created_at
+                    """,
                     (run_id,),
                 ).fetchall()
             ]

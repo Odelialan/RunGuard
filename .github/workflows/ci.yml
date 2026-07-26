@@ -65,11 +65,22 @@ jobs:
           docker compose config --quiet
           helm lint deploy/helm/runguard \
             --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
-            --set-string secrets.openaiApiKey=ci-validation-only
+            --set-string secrets.openaiApiKey=ci-validation-only \
+            --set-string secrets.prometheusWebhookSecret=ci-webhook-secret \
+            --set-string secrets.langgraphAesKey=ci-key-16-bytes! \
+            --set-string auth.oidcIssuer=https://idp.example.com \
+            --set-string auth.oidcAudience=runguard \
+            --set-string auth.oidcJwksUrl=https://idp.example.com/.well-known/jwks.json
           helm template runguard deploy/helm/runguard \
             --namespace runguard-system \
             --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
-            --set-string secrets.openaiApiKey=ci-validation-only >/tmp/runguard-helm.yaml
+            --set-string secrets.openaiApiKey=ci-validation-only \
+            --set-string secrets.prometheusWebhookSecret=ci-webhook-secret \
+            --set-string secrets.langgraphAesKey=ci-key-16-bytes! \
+            --set-string auth.oidcIssuer=https://idp.example.com \
+            --set-string auth.oidcAudience=runguard \
+            --set-string auth.oidcJwksUrl=https://idp.example.com/.well-known/jwks.json \
+            >/tmp/runguard-helm.yaml
       - name: Test Rego with OPA
         run: |
           docker run --rm \
@@ -107,9 +118,24 @@ jobs:
             -e RUNGUARD_REDIS_URL=redis://redis:6379/0 \
             -e RUNGUARD_POLICY_BACKEND=opa \
             -e RUNGUARD_OPA_URL=http://opa:8181 \
-            -e RUNGUARD_CONNECTOR_MODE=mock \
-            -e RUNGUARD_AGENT_BACKEND=deterministic \
-            -e RUNGUARD_EXECUTION_MODE=simulation \
+            -e RUNGUARD_ENFORCE_PRODUCTION_GUARDS=true \
+            -e RUNGUARD_CONNECTOR_MODE=production \
+            -e RUNGUARD_PROMETHEUS_URL=http://prometheus.invalid:9090 \
+            -e RUNGUARD_LOKI_URL=http://loki.invalid:3100 \
+            -e RUNGUARD_GITHUB_REPOSITORY=Odelialan/RunGuard \
+            -e RUNGUARD_GITHUB_TOKEN=ci-validation-only \
+            -e RUNGUARD_AGENT_BACKEND=langgraph \
+            -e RUNGUARD_EXECUTION_MODE=kubernetes_job \
+            -e RUNGUARD_PROMETHEUS_WEBHOOK_SECRET=ci-webhook-secret \
+            -e RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT=http://otel.invalid:4318 \
+            -e RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND=postgres \
+            -e 'LANGGRAPH_AES_KEY=ci-key-16-bytes!' \
+            -e RUNGUARD_AUTO_RECOVER=true \
+            -e OPENAI_API_KEY=ci-validation-only \
+            -e RUNGUARD_AUTH_MODE=api_key \
+            -e 'RUNGUARD_API_KEYS_JSON={"ci-token":{"subject":"ci","roles":["admin"]}}' \
+            -e RUNGUARD_CORS_ORIGINS=https://runguard.example.com \
+            -e RUNGUARD_CORS_ORIGIN_REGEX= \
             runguard-api:ci
           for attempt in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:8000/api/ready >/tmp/ready.json; then
@@ -119,12 +145,19 @@ jobs:
           done
           cat /tmp/ready.json
           curl -fsS http://127.0.0.1:8000/ >/dev/null
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:8000/api/incidents \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"Unauthorized","service":"order-api"}')" = 401
           curl -fsS -X POST http://127.0.0.1:8000/api/incidents \
+            -H 'Authorization: Bearer ci-token' \
             -H 'Content-Type: application/json' \
             -d '{"title":"CI production integration","severity":"P2","service":"order-api","environment":"staging","description":"PostgreSQL and Redis validation."}' \
             >/tmp/incident.json
-          curl -fsS http://127.0.0.1:8000/api/events/stream >/tmp/events.json
+          curl -fsS http://127.0.0.1:8000/api/events/stream \
+            -H 'Authorization: Bearer ci-token' >/tmp/events.json
           curl -fsS -X POST http://127.0.0.1:8000/api/policies/simulate \
+            -H 'Authorization: Bearer ci-token' \
             -H 'Content-Type: application/json' \
             -d '{"environment":"production","tool":"kubernetes.patch_deployment","resource":"order-api","risk_level":"R2","has_rollback":true,"incident_severity":"P1"}' \
             >/tmp/policy.json
@@ -133,16 +166,20 @@ jobs:
           ready = json.load(open("/tmp/ready.json"))
           events = json.load(open("/tmp/events.json"))
           policy = json.load(open("/tmp/policy.json"))
-          assert ready["components"] == {
-              "database": "ready",
-              "redis": "ready",
-              "policy": "ready",
-          }
+          assert ready["components"]["database"] == "ready"
+          assert ready["components"]["redis"] == "ready"
+          assert ready["components"]["policy"] == "ready"
+          assert ready["components"]["authentication"] == "ready"
           assert events and events[0]["event_type"] == "incident.created"
           assert policy["decision"] == "require_approval"
           assert policy["backend"] == "opa"
           print("Container integration passed")
           PY
+          docker exec postgres psql -U runguard -d runguard -Atc \
+            "SELECT count(*) FROM schema_migrations" | grep -qx 2
+          docker exec postgres psql -U runguard -d runguard -Atc \
+            "SELECT to_regclass('public.workflow_checkpoints')" \
+            | grep -qx workflow_checkpoints
       - name: Print container logs on failure
         if: failure()
         run: |
