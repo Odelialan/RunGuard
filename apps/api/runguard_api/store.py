@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -66,6 +67,7 @@ class Store:
         database_pool_min_size: int = 2,
         database_pool_max_size: int = 20,
         telemetry: Telemetry | None = None,
+        outbox_enabled: bool = False,
     ) -> None:
         self.database_path = database_path
         self.database_url = database_url
@@ -73,6 +75,7 @@ class Store:
         self.seed = seed
         self.vector_dimensions = vector_dimensions
         self.telemetry = telemetry
+        self.outbox_enabled = outbox_enabled
         self._pool: Any = None
         if database_url:
             from psycopg.rows import dict_row
@@ -203,6 +206,8 @@ class Store:
             duration_ms INTEGER NOT NULL,
             created_at TEXT NOT NULL
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS execution_results_tool_intent_unique_idx
+            ON execution_results (tool_intent_id);
         CREATE TABLE IF NOT EXISTS trace_spans (
             id TEXT PRIMARY KEY,
             run_id TEXT NOT NULL REFERENCES agent_runs(id),
@@ -254,6 +259,33 @@ class Store:
         );
         CREATE INDEX IF NOT EXISTS workflow_checkpoints_incident_created_idx
             ON workflow_checkpoints (incident_id, created_at);
+        CREATE TABLE IF NOT EXISTS ingress_receipts (
+            idempotency_key TEXT PRIMARY KEY,
+            source TEXT NOT NULL,
+            incident_id TEXT NOT NULL REFERENCES incidents(id),
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS event_outbox (
+            id TEXT PRIMARY KEY,
+            event_type TEXT NOT NULL,
+            incident_id TEXT NOT NULL REFERENCES incidents(id),
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            claimed_at TEXT,
+            claimed_by TEXT,
+            published_at TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS event_outbox_pending_idx
+            ON event_outbox (created_at)
+            WHERE published_at IS NULL;
+        CREATE INDEX IF NOT EXISTS event_outbox_incident_pending_idx
+            ON event_outbox (incident_id, created_at, id)
+            WHERE published_at IS NULL;
+        CREATE INDEX IF NOT EXISTS event_outbox_published_idx
+            ON event_outbox (published_at)
+            WHERE published_at IS NOT NULL;
         """
         with self._lock, self.connect() as connection:
             if self.backend == "postgresql":
@@ -639,6 +671,11 @@ class Store:
         payload: dict[str, Any],
         created_at: str | None = None,
     ) -> dict[str, Any]:
+        if self.backend == "postgresql":
+            connection.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended(?, 0))",
+                (incident_id,),
+            )
         sequence_row = connection.execute(
             """
             SELECT COALESCE(MAX(sequence), 0) + 1 AS next_sequence
@@ -668,40 +705,119 @@ class Store:
             """,
             {**event, "payload": json_dumps(payload)},
         )
+        self._append_outbox_tx(
+            connection,
+            event["id"],
+            event_type,
+            incident_id,
+            {"actor": actor, **payload},
+            event["created_at"],
+        )
         return event
 
-    def create_incident(self, payload: IncidentCreate, source: str = "manual") -> dict[str, Any]:
-        with self._lock, self.connect() as connection:
-            incident_id = self._next_incident_id(connection)
-            now = utc_now()
-            connection.execute(
-                """
-                INSERT INTO incidents
-                    (id, title, severity, service, environment, status, description,
-                     created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, 'NEW', ?, ?, ?)
-                """,
-                (
-                    incident_id,
-                    payload.title,
-                    str(payload.severity),
-                    payload.service,
-                    payload.environment,
-                    payload.description,
-                    now,
-                    now,
-                ),
-            )
-            self._append_event_tx(
-                connection,
+    def _append_outbox_tx(
+        self,
+        connection: Any,
+        event_id: str,
+        event_type: str,
+        incident_id: str,
+        payload: dict[str, Any],
+        created_at: str | None = None,
+    ) -> None:
+        if not self.outbox_enabled:
+            return
+        connection.execute(
+            """
+            INSERT INTO event_outbox
+                (id, event_type, incident_id, payload, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                event_type,
                 incident_id,
-                "incident.created",
-                "event-gateway",
-                {"source": source, "status": "NEW"},
-            )
-        return self.get_incident(incident_id)
+                json_dumps(payload),
+                created_at or utc_now(),
+            ),
+        )
 
-    def list_incidents(self) -> list[dict[str, Any]]:
+    def create_incident(
+        self,
+        payload: IncidentCreate,
+        source: str = "manual",
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        deduplicated = False
+        with self._lock, self.connect() as connection:
+            if self.backend == "postgresql" and idempotency_key:
+                connection.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(?, 1))",
+                    (idempotency_key,),
+                )
+            receipt = (
+                connection.execute(
+                    "SELECT incident_id FROM ingress_receipts WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if idempotency_key
+                else None
+            )
+            if receipt:
+                incident_id = receipt["incident_id"]
+                deduplicated = True
+            else:
+                incident_id = self._next_incident_id(connection)
+                now = utc_now()
+                connection.execute(
+                    """
+                    INSERT INTO incidents
+                        (id, title, severity, service, environment, status, description,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 'NEW', ?, ?, ?)
+                    """,
+                    (
+                        incident_id,
+                        payload.title,
+                        str(payload.severity),
+                        payload.service,
+                        payload.environment,
+                        payload.description,
+                        now,
+                        now,
+                    ),
+                )
+                self._append_event_tx(
+                    connection,
+                    incident_id,
+                    "incident.created",
+                    "event-gateway",
+                    {
+                        "source": source,
+                        "status": "NEW",
+                        "severity": str(payload.severity),
+                    },
+                )
+                if idempotency_key:
+                    connection.execute(
+                        """
+                        INSERT INTO ingress_receipts
+                            (idempotency_key, source, incident_id, created_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (idempotency_key, source, incident_id, now),
+                    )
+        incident = self.get_incident(incident_id)
+        if deduplicated:
+            incident["_deduplicated"] = True
+        return incident
+
+    def list_incidents(
+        self,
+        *,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -711,7 +827,9 @@ class Store:
                      WHERE ti.incident_id = i.id
                        AND ti.status = 'WAITING_APPROVAL') AS pending_approvals
                 FROM incidents i ORDER BY i.created_at DESC
-                """
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
             ).fetchall()
         return [self._row(row) for row in rows]
 
@@ -775,6 +893,9 @@ class Store:
         status: IncidentStatus,
         actor: str,
         payload: dict[str, Any] | None = None,
+        *,
+        allowed_from: set[str] | None = None,
+        stream_event: tuple[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         with self._lock, self.connect() as connection:
             current = connection.execute(
@@ -782,6 +903,10 @@ class Store:
             ).fetchone()
             if not current:
                 raise KeyError(incident_id)
+            if allowed_from is not None and current["status"] not in allowed_from:
+                raise ValueError(
+                    f"Incident cannot transition from {current['status']} to {status}."
+                )
             now = utc_now()
             connection.execute(
                 """
@@ -798,6 +923,16 @@ class Store:
                 actor,
                 {"from": current["status"], "to": str(status), **(payload or {})},
             )
+            if stream_event:
+                event_type, event_payload = stream_event
+                self._append_outbox_tx(
+                    connection,
+                    f"OUT-{uuid4().hex[:10].upper()}",
+                    event_type,
+                    incident_id,
+                    event_payload,
+                    utc_now(),
+                )
         return self.get_incident(incident_id)
 
     def create_run(
@@ -859,7 +994,7 @@ class Store:
                         item["title"],
                         item["content"],
                         utc_now(),
-                        uuid4().hex,
+                        hashlib.sha256(item["content"].encode("utf-8")).hexdigest(),
                         json_dumps(item.get("metadata", {})),
                     ),
                 )
@@ -964,35 +1099,15 @@ class Store:
         risk_level: str,
     ) -> dict[str, Any]:
         intent_id = f"INT-{uuid4().hex[:8].upper()}"
-        idempotency_key = f"{incident_id.lower()}-{tool_name.replace('.', '-')}-01"
+        idempotency_key = (
+            f"{incident_id.lower()}-{run_id.lower()}-{tool_name.replace('.', '-')}-01"
+        )
         with self._lock, self.connect() as connection:
             existing = connection.execute(
                 "SELECT * FROM tool_intents WHERE idempotency_key = ?",
                 (idempotency_key,),
             ).fetchone()
             if existing:
-                if existing["status"] not in {"EXECUTED", "ROLLED_BACK"}:
-                    connection.execute(
-                        """
-                        UPDATE tool_intents
-                        SET run_id = ?, resource = ?, arguments = ?, rollback = ?,
-                            risk_level = ?, status = 'PENDING', created_at = ?
-                        WHERE id = ?
-                        """,
-                        (
-                            run_id,
-                            json_dumps(resource),
-                            json_dumps(arguments),
-                            json_dumps(rollback),
-                            risk_level,
-                            utc_now(),
-                            existing["id"],
-                        ),
-                    )
-                    existing = connection.execute(
-                        "SELECT * FROM tool_intents WHERE id = ?",
-                        (existing["id"],),
-                    ).fetchone()
                 return self._decode(existing, "resource", "arguments", "rollback")
             connection.execute(
                 """
@@ -1220,6 +1335,28 @@ class Store:
                 (risk_level, intent_id),
             )
 
+    def claim_execution(self, intent_id: str) -> dict[str, Any]:
+        with self._lock, self.connect() as connection:
+            row = connection.execute(
+                "SELECT status FROM tool_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(intent_id)
+            if row["status"] == "APPROVED":
+                updated = connection.execute(
+                    """
+                    UPDATE tool_intents SET status = 'EXECUTING'
+                    WHERE id = ? AND status = 'APPROVED'
+                    """,
+                    (intent_id,),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError("Tool intent execution was claimed concurrently.")
+            elif row["status"] != "EXECUTING":
+                raise ValueError(f"Tool intent is not executable: {row['status']}")
+        return self.get_intent(intent_id)
+
     def record_execution(
         self,
         intent_id: str,
@@ -1227,8 +1364,16 @@ class Store:
         before: dict[str, Any],
         after: dict[str, Any],
         duration_ms: int,
+        *,
+        succeeded: bool,
     ) -> dict[str, Any]:
         with self._lock, self.connect() as connection:
+            intent = connection.execute(
+                "SELECT arguments, status FROM tool_intents WHERE id = ?",
+                (intent_id,),
+            ).fetchone()
+            if not intent:
+                raise KeyError(intent_id)
             existing = connection.execute(
                 "SELECT * FROM execution_results WHERE tool_intent_id = ?",
                 (intent_id,),
@@ -1259,10 +1404,39 @@ class Store:
                     utc_now(),
                 ),
             )
-            connection.execute(
-                "UPDATE tool_intents SET status = 'EXECUTED' WHERE id = ?",
-                (intent_id,),
-            )
+            if succeeded:
+                raw_arguments = intent["arguments"]
+                arguments = (
+                    json.loads(raw_arguments)
+                    if isinstance(raw_arguments, str)
+                    else dict(raw_arguments or {})
+                )
+                captured_rollback = {
+                    key: value
+                    for key, value in arguments.items()
+                    if key
+                    in {
+                        "service",
+                        "environment",
+                        "namespace",
+                        "name",
+                        "container",
+                    }
+                }
+                captured_rollback.update(before)
+                connection.execute(
+                    """
+                    UPDATE tool_intents
+                    SET status = 'EXECUTED', rollback = ?
+                    WHERE id = ?
+                    """,
+                    (json_dumps(captured_rollback), intent_id),
+                )
+            else:
+                connection.execute(
+                    "UPDATE tool_intents SET status = 'EXECUTION_FAILED' WHERE id = ?",
+                    (intent_id,),
+                )
             row = connection.execute(
                 "SELECT * FROM execution_results WHERE id = ?", (execution_id,)
             ).fetchone()
@@ -1288,8 +1462,13 @@ class Store:
                 (json_dumps(rollback_result), intent_id),
             )
             connection.execute(
-                "UPDATE tool_intents SET status = 'ROLLED_BACK' WHERE id = ?",
-                (intent_id,),
+                "UPDATE tool_intents SET status = ? WHERE id = ?",
+                (
+                    "ROLLED_BACK"
+                    if bool(rollback_result.get("ok"))
+                    else "ROLLBACK_FAILED",
+                    intent_id,
+                ),
             )
             row = connection.execute(
                 "SELECT * FROM execution_results WHERE tool_intent_id = ?",
@@ -1518,6 +1697,14 @@ class Store:
                     'VERIFYING',
                     'ROLLING_BACK'
                 )
+                OR (
+                    status = 'WAITING_APPROVAL'
+                    AND EXISTS (
+                        SELECT 1 FROM tool_intents
+                        WHERE tool_intents.incident_id = incidents.id
+                          AND tool_intents.status = 'APPROVED'
+                    )
+                )
                 ORDER BY updated_at
                 """
             ).fetchall()
@@ -1610,6 +1797,156 @@ class Store:
         if not row:
             raise KeyError(eval_id)
         return self._decode(row, "metrics", "cases")
+
+    def claim_outbox(
+        self,
+        worker_id: str,
+        *,
+        limit: int = 100,
+        lease_seconds: int = 60,
+    ) -> list[dict[str, Any]]:
+        if not self.outbox_enabled:
+            return []
+        now = utc_now()
+        stale_before = (datetime.now(UTC) - timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock, self.connect() as connection:
+            if self.backend == "postgresql":
+                rows = connection.execute(
+                    """
+                    WITH candidates AS (
+                        SELECT candidate.id FROM event_outbox AS candidate
+                        WHERE candidate.published_at IS NULL
+                          AND (candidate.claimed_at IS NULL OR candidate.claimed_at < ?)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM event_outbox AS older
+                              WHERE older.incident_id = candidate.incident_id
+                                AND older.published_at IS NULL
+                                AND (
+                                    older.created_at < candidate.created_at
+                                    OR (
+                                        older.created_at = candidate.created_at
+                                        AND older.id < candidate.id
+                                    )
+                                )
+                          )
+                        ORDER BY candidate.created_at, candidate.id
+                        LIMIT ?
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    UPDATE event_outbox AS outbox
+                    SET claimed_at = ?, claimed_by = ?,
+                        attempts = outbox.attempts + 1, last_error = NULL
+                    FROM candidates
+                    WHERE outbox.id = candidates.id
+                    RETURNING outbox.*
+                    """,
+                    (stale_before, limit, now, worker_id),
+                ).fetchall()
+            else:
+                candidates = connection.execute(
+                    """
+                    SELECT candidate.id FROM event_outbox AS candidate
+                    WHERE candidate.published_at IS NULL
+                      AND (candidate.claimed_at IS NULL OR candidate.claimed_at < ?)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM event_outbox AS older
+                          WHERE older.incident_id = candidate.incident_id
+                            AND older.published_at IS NULL
+                            AND (
+                                older.created_at < candidate.created_at
+                                OR (
+                                    older.created_at = candidate.created_at
+                                    AND older.id < candidate.id
+                                )
+                            )
+                      )
+                    ORDER BY candidate.created_at, candidate.id LIMIT ?
+                    """,
+                    (stale_before, limit),
+                ).fetchall()
+                claimed_ids: list[str] = []
+                for candidate in candidates:
+                    updated = connection.execute(
+                        """
+                        UPDATE event_outbox
+                        SET claimed_at = ?, claimed_by = ?,
+                            attempts = attempts + 1, last_error = NULL
+                        WHERE id = ? AND published_at IS NULL
+                          AND (claimed_at IS NULL OR claimed_at < ?)
+                        """,
+                        (now, worker_id, candidate["id"], stale_before),
+                    )
+                    if updated.rowcount == 1:
+                        claimed_ids.append(candidate["id"])
+                rows = [
+                    connection.execute(
+                        "SELECT * FROM event_outbox WHERE id = ?",
+                        (event_id,),
+                    ).fetchone()
+                    for event_id in claimed_ids
+                ]
+        return [self._decode(row, "payload") for row in rows if row]
+
+    def mark_outbox_published(self, event_id: str, worker_id: str) -> bool:
+        with self._lock, self.connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE event_outbox
+                SET published_at = ?, claimed_at = NULL, claimed_by = NULL
+                WHERE id = ? AND claimed_by = ? AND published_at IS NULL
+                """,
+                (utc_now(), event_id, worker_id),
+            )
+        return updated.rowcount == 1
+
+    def release_outbox_claim(
+        self,
+        event_id: str,
+        worker_id: str,
+        error: str,
+    ) -> bool:
+        with self._lock, self.connect() as connection:
+            updated = connection.execute(
+                """
+                UPDATE event_outbox
+                SET claimed_at = NULL, claimed_by = NULL, last_error = ?
+                WHERE id = ? AND claimed_by = ? AND published_at IS NULL
+                """,
+                (error[:1000], event_id, worker_id),
+            )
+        return updated.rowcount == 1
+
+    def outbox_pending_count(self) -> int:
+        if not self.outbox_enabled:
+            return 0
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) AS count FROM event_outbox WHERE published_at IS NULL"
+            ).fetchone()
+        return int(row["count"])
+
+    def prune_published_outbox(
+        self,
+        *,
+        retention_days: int = 7,
+        limit: int = 1000,
+    ) -> int:
+        if not self.outbox_enabled:
+            return 0
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        with self._lock, self.connect() as connection:
+            deleted = connection.execute(
+                """
+                DELETE FROM event_outbox
+                WHERE id IN (
+                    SELECT id FROM event_outbox
+                    WHERE published_at IS NOT NULL AND published_at < ?
+                    ORDER BY published_at LIMIT ?
+                )
+                """,
+                (cutoff, limit),
+            )
+        return deleted.rowcount
 
     def overview(self) -> dict[str, Any]:
         with self.connect() as connection:

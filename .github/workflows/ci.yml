@@ -64,15 +64,8 @@ jobs:
         run: |
           docker compose config --quiet
           helm lint deploy/helm/runguard \
-            --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
-            --set-string secrets.openaiApiKey=ci-validation-only \
-            --set-string secrets.prometheusWebhookSecret=ci-webhook-secret \
-            --set-string secrets.langgraphAesKey=ci-key-16-bytes! \
-            --set-string auth.oidcIssuer=https://idp.example.com \
-            --set-string auth.oidcAudience=runguard \
-            --set-string auth.oidcJwksUrl=https://idp.example.com/.well-known/jwks.json
-          helm template runguard deploy/helm/runguard \
-            --namespace runguard-system \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string runnerImage.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
             --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
             --set-string secrets.openaiApiKey=ci-validation-only \
             --set-string secrets.prometheusWebhookSecret=ci-webhook-secret \
@@ -80,7 +73,25 @@ jobs:
             --set-string auth.oidcIssuer=https://idp.example.com \
             --set-string auth.oidcAudience=runguard \
             --set-string auth.oidcJwksUrl=https://idp.example.com/.well-known/jwks.json \
+            --set-string config.targetInventory.order-api.environment=production \
+            --set-string config.targetInventory.order-api.namespace=runguard-system \
+            --set-string config.targetInventory.order-api.name=order-api
+          helm template runguard deploy/helm/runguard \
+            --namespace runguard-system \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string runnerImage.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
+            --set-string secrets.openaiApiKey=ci-validation-only \
+            --set-string secrets.prometheusWebhookSecret=ci-webhook-secret \
+            --set-string secrets.langgraphAesKey=ci-key-16-bytes! \
+            --set-string auth.oidcIssuer=https://idp.example.com \
+            --set-string auth.oidcAudience=runguard \
+            --set-string auth.oidcJwksUrl=https://idp.example.com/.well-known/jwks.json \
+            --set-string config.targetInventory.order-api.environment=production \
+            --set-string config.targetInventory.order-api.namespace=runguard-system \
+            --set-string config.targetInventory.order-api.name=order-api \
             >/tmp/runguard-helm.yaml
+          grep -q 'RUNGUARD_MAX_REQUEST_BODY_BYTES: "1048576"' /tmp/runguard-helm.yaml
       - name: Test Rego with OPA
         run: |
           docker run --rm \
@@ -90,6 +101,7 @@ jobs:
       - name: Build production images
         run: |
           docker build -f deploy/docker/api.Dockerfile -t runguard-api:ci .
+          docker build -f deploy/docker/runner.Dockerfile -t runguard-runner:ci .
           docker build -f deploy/docker/web.Dockerfile -t runguard-web:ci .
           docker build -f deploy/docker/fault-injector.Dockerfile -t runguard-fault-injector:ci .
       - name: Start PostgreSQL, Redis and OPA
@@ -134,8 +146,12 @@ jobs:
             -e OPENAI_API_KEY=ci-validation-only \
             -e RUNGUARD_AUTH_MODE=api_key \
             -e 'RUNGUARD_API_KEYS_JSON={"ci-token":{"subject":"ci","roles":["admin"]}}' \
+            -e RUNGUARD_KUBERNETES_ALLOWED_NAMESPACES=runguard-system \
+            -e RUNGUARD_KUBERNETES_RUNNER_IMAGE=ghcr.io/odelialan/runguard-runner@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            -e 'RUNGUARD_TARGET_INVENTORY_JSON={"order-api":{"environment":"production","namespace":"runguard-system","name":"order-api"}}' \
             -e RUNGUARD_CORS_ORIGINS=https://runguard.example.com \
             -e RUNGUARD_CORS_ORIGIN_REGEX= \
+            -e RUNGUARD_PUBLIC_BASE_URL=https://runguard.example.com \
             runguard-api:ci
           for attempt in $(seq 1 40); do
             if curl -fsS http://127.0.0.1:8000/api/ready >/tmp/ready.json; then
@@ -152,7 +168,7 @@ jobs:
           curl -fsS -X POST http://127.0.0.1:8000/api/incidents \
             -H 'Authorization: Bearer ci-token' \
             -H 'Content-Type: application/json' \
-            -d '{"title":"CI production integration","severity":"P2","service":"order-api","environment":"staging","description":"PostgreSQL and Redis validation."}' \
+            -d '{"title":"CI production integration","severity":"P2","service":"order-api","environment":"production","description":"PostgreSQL and Redis validation."}' \
             >/tmp/incident.json
           curl -fsS http://127.0.0.1:8000/api/events/stream \
             -H 'Authorization: Bearer ci-token' >/tmp/events.json
@@ -176,7 +192,7 @@ jobs:
           print("Container integration passed")
           PY
           docker exec postgres psql -U runguard -d runguard -Atc \
-            "SELECT count(*) FROM schema_migrations" | grep -qx 2
+            "SELECT count(*) FROM schema_migrations" | grep -qx 4
           docker exec postgres psql -U runguard -d runguard -Atc \
             "SELECT to_regclass('public.workflow_checkpoints')" \
             | grep -qx workflow_checkpoints

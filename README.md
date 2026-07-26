@@ -2,14 +2,14 @@
 
 > Agentic SRE 事故响应与可信执行平台
 
-[![Version](https://img.shields.io/badge/version-1.2.0-6ef0b5)](./VERSION)
+[![Version](https://img.shields.io/badge/version-1.2.1-6ef0b5)](./VERSION)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-78aef7)](./pyproject.toml)
 [![React](https://img.shields.io/badge/React-TypeScript-78aef7)](./apps/web/package.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-ac92ff)](./LICENSE)
 
 RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行、效果验证和复盘记录连接为一条可审计的事故响应链路。LLM 只生成结构化 Tool Intent，无法直接获得基础设施凭据；所有写操作必须经过参数校验、风险分级、策略判断、幂等控制与回滚检查。
 
-当前版本：**1.2.0** · 发布日期：**2026-07-26**
+当前版本：**1.2.1** · 发布日期：**2026-07-26**
 作者：**OdeliaLan**
 
 ## 1.2 能力
@@ -24,12 +24,15 @@ RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行�
 - 生产写操作人工审批，R3 操作默认拒绝
 - PostgreSQL + pgvector 证据存储、语义检索与 Redis Streams 事件总线
 - PostgreSQL LangGraph Checkpointer、外层工作流检查点与重启自动恢复
-- Redis 分布式执行锁，防止多副本重复启动、执行或补偿
+- 带租约续期的 Redis 分布式执行锁，防止多副本重复启动、执行或补偿
+- PostgreSQL 事务型 Outbox 向 Redis Streams 提供至少一次事件投递
+- 异步请求路径将同步 Store I/O 隔离到线程池，避免阻塞 Agent 与锁续租事件循环
 - Kubernetes Job 沙箱、独立 ServiceAccount、最小 RBAC、RuntimeDefault seccomp
-- Tool Intent 幂等键、before/after snapshot、失败验证与真实补偿回滚
+- Tool Intent 幂等键、持久化 before/after snapshot、失败验证与真实补偿回滚
+- 生产验证同时检查 P95、错误率与 Deployment 就绪副本
 - OpenTelemetry OTLP Trace，可接 Tempo/Jaeger 与 Grafana
 - append-only Incident Event 事件记录
-- Recorded MCP 重放模式，重放不产生副作用
+- Recorded MCP Transport 抽象；当前 Replay API 仅生成无副作用的审计摘要
 - A2A 1.0 Reviewer Agent Card、JSON-RPC 审查服务与远程 Reviewer Client
 - 结构化 Postmortem 页面、JSON/Markdown 导出与行动项
 - 12 个固定故障案例及可复现评测报告
@@ -127,7 +130,7 @@ hostname -I
 4. 审核证据、变更差异、策略原因、回滚参数和幂等键后批准或拒绝。
 5. 批准后进入模拟沙箱执行并自动验证 P95、错误率和工作负载稳定性。
 6. 在 Trace Explorer 查看 Agent、检索、工具、策略、审批、执行和验证 Span。
-7. 在 Evaluations 运行 `baseline-12`，生成带范围声明的实测报告。
+7. 在 Evaluations 运行 `baseline-12`，生成带范围声明的静态参考报告。
 
 ## 系统架构
 
@@ -158,7 +161,8 @@ flowchart LR
 ```
 
 本地安全模式继续支持 SQLite 零依赖演示；生产模式使用 Psycopg 3 连接 PostgreSQL，
-在 Evidence 表启用 pgvector，并通过 Redis Streams 输出可消费、可重放的事故事件。
+在 Evidence 表启用 pgvector，并通过事务型 Outbox 向 Redis Streams 输出可消费、
+可重放的事故事件。每条 Stream 消息包含稳定 `event_id`，消费者应使用它去重。
 连接器采用统一 Transport 接口隔离 Production、Hybrid、Mock 与 Recorded 实现。
 
 ## 可信执行路径
@@ -248,11 +252,31 @@ Python 求值器；生产设置 `RUNGUARD_POLICY_BACKEND=opa` 后，独立 OPA D
 | `RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND` | `postgres` | 持久化 Graph 节点状态 |
 | `RUNGUARD_POLICY_BACKEND` | `opa` | 使用独立 OPA |
 | `RUNGUARD_EXECUTION_MODE` | `kubernetes_job` | 使用受限 Job 执行 |
+| `RUNGUARD_TARGET_INVENTORY_JSON` | 服务到环境/Namespace/资源名的映射 | 服务端绑定真实执行目标，拒绝客户端或 Agent 改写环境 |
 | `RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT` | Collector HTTP 端点 | 输出 OTLP Trace |
 | `RUNGUARD_A2A_REVIEWER_URL` | A2A JSON-RPC URL | 委托独立 Reviewer |
 | `RUNGUARD_AUTH_MODE` | `oidc` 或 `api_key` | 启用身份认证与 RBAC |
+| `RUNGUARD_PUBLIC_BASE_URL` | `https://runguard.example.com` | 固定 Agent Card 公网地址，避免信任请求 Host |
+| `RUNGUARD_MAX_REQUEST_BODY_BYTES` | `1048576` | 限制写请求体，包含无 Content-Length 的流式请求 |
 | `RUNGUARD_ENFORCE_PRODUCTION_GUARDS` | `true` | 启动时强制校验生产安全基线 |
 | `RUNGUARD_AUTO_RECOVER` | `true` | 重启后恢复未完成工作流 |
+
+生产目标清单示例：
+
+```json
+{
+  "order-api": {
+    "environment": "production",
+    "namespace": "runguard-system",
+    "name": "order-api"
+  }
+}
+```
+
+Helm 生产安装还要求 `image.digest` 与 `runnerImage.digest`，执行控制面和 Runner
+均以不可变镜像摘要部署。事件中提交的 `environment` 必须与目标清单一致。
+手工部署时，`RUNGUARD_KUBERNETES_RUNNER_IMAGE` 同样必须使用
+`repository@sha256:<64位摘要>` 格式。
 
 所有密钥仅通过 Secret/环境变量注入。Helm Chart 不包含真实密钥，安装时必须提供。
 生产集群建议预先创建 Secret，并通过 `secrets.existingSecret` 引用，避免把密钥写进
@@ -262,6 +286,7 @@ Prometheus Webhook 请求必须携带 Unix 秒时间戳 `X-RunGuard-Timestamp` �
 `X-RunGuard-Signature`。签名内容为
 `HMAC-SHA256(secret, "<timestamp>.<raw-body>")`，请求头格式为
 `sha256=<hex-digest>`；超过五分钟的请求会被拒绝，以降低重放风险。
+相同标签与 `startsAt` 的重复通知只创建一个 Incident，非 `firing` 通知不会创建 Incident。
 
 ## 评测集
 
@@ -280,7 +305,7 @@ Prometheus Webhook 请求必须携带 Unix 秒时间戳 `X-RunGuard-Timestamp` �
 11. 日志平台不可用
 12. 多个候选根因并存
 
-Dashboard 展示 Top-1/Top-3 根因命中、策略准确率、危险操作拦截、Trace 覆盖、重复副作用、工具调用次数与处理耗时。所有数值明确标注为**确定性模拟评测**，不冒充生产环境效果。
+Dashboard 展示 Top-1/Top-3 根因期望、策略期望、危险操作拦截、Trace 覆盖、重复副作用、工具调用次数与处理耗时。当前 `baseline-12` 是**静态确定性参考夹具**，不执行真实模型、故障注入、Worker 中断或 Kubernetes 变更，不能作为实测成果。
 
 ## 仓库结构
 
@@ -312,6 +337,21 @@ RunGuard/
 ```
 
 该脚本会检查 Python 静态规则、前端类型与生产构建、API smoke test、Git 追踪文件大小和常见凭据模式。
+
+## 1.2.1 发布记录
+
+**2026-07-26 · Adversarial reliability review**
+
+- 将 Webhook HMAC 验签前置到限流之前，避免无效请求抢占合法告警预算。
+- 增加事务型 Outbox、稳定 Event ID、执行锁租约续期和同步 Store I/O 线程隔离。
+- 增加生产目标清单、不可变 Runner 镜像摘要、请求体限制与告警入口去重。
+- Kubernetes Runner 将真实 before snapshot 与幂等标记一同持久化；Scale 变更改为单次原子 Deployment patch。
+- 幂等重放恢复原始 before snapshot，避免进程崩溃后生成错误补偿参数。
+- 生产验证由单一延迟信号扩展为 P95、错误率和 Deployment 就绪副本三方验证。
+- 调查证据新增 Deployment 状态，补齐工作负载证据。
+- 对齐 MCP 工具发现结果并删除执行器不再使用的 Kubernetes RBAC 权限。
+- 明确 `baseline-12` 为静态参考夹具，移除“已实测”表述。
+- 扩充本地缓存、覆盖率报告、私有草稿和大文件忽略规则；运行所需 Prompt 与自动化测试继续版本化。
 
 ## 1.2.0 发布记录
 
@@ -357,10 +397,15 @@ RunGuard/
 - 生产模式必须配置 OIDC 或 API Key；身份提供方中的角色需映射为
   `viewer`、`operator`、`approver`、`service` 或 `admin`。
 - 远程 MCP 模式要求四类 MCP Server 使用 Streamable HTTP，并由网络策略或 OAuth
-  保护；RunGuard 不把集群写权限交给远程 MCP Server。
+  保护；只有精确只读白名单会发送到远程 Server，基础设施写入始终留在本地受限 Job。
 - Helm 默认采用单集群、Namespace 级最小权限；企业 SSO、多租户和多集群调度需要按组织
   IAM 与网络边界单独集成。
 - 未配置生产依赖时，系统明确显示 Mock/Simulation，不会把模拟数据标记成生产结果。
+- `baseline-12` 尚未驱动真实故障注入或模型推理；当前分数仅是参考夹具，不是实验数据。
+- Replay API 尚未重新执行 Recorded 模型/工具轨迹，只返回已有 Run 的无副作用审计摘要。
+- A2A Reviewer 可调用外部服务，但仓库未提供独立 Reviewer 部署单元。
+- Shadow Mode、Canary Execution、每次 Incident 的 Token/工具/时间预算尚未实现。
+- 语义 Evidence Search 已提供 API，但历史 Incident Memory 尚未自动进入调查决策。
 
 ## License
 

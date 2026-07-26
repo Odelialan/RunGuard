@@ -34,11 +34,18 @@ config:
   llmModel: gpt-5-mini
   verificationUrlTemplate: http://fault-sentinel.runguard-system.svc/health
   allowedNamespaces: runguard-system
+  targetInventory:
+    order-api:
+      environment: staging
+      namespace: runguard-system
+      name: order-api
   checkpointBackend: memory
   autoRecover: false
   recoveryConcurrency: 2
   corsOrigins: http://127.0.0.1:8088
   corsOriginRegex: ""
+  publicBaseUrl: http://127.0.0.1:8088
+  maxRequestBodyBytes: 1048576
 
 auth:
   mode: disabled

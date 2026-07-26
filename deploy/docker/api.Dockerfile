@@ -6,21 +6,23 @@ COPY apps/web ./
 RUN npm run build
 
 FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /uvx /bin/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     RUNGUARD_DATABASE_PATH=/data/runguard.db \
     RUNGUARD_MIGRATIONS_DIR=/app/deploy/postgres \
-    RUNGUARD_WEB_DIST=/app/apps/web/dist
+    RUNGUARD_WEB_DIST=/app/apps/web/dist \
+    PATH=/app/.venv/bin:$PATH
 
 WORKDIR /app
 
-COPY pyproject.toml README.md VERSION ./
+COPY pyproject.toml uv.lock README.md VERSION ./
 COPY apps/api ./apps/api
 COPY agents/prompts ./agents/prompts
 COPY deploy/postgres ./deploy/postgres
 COPY --from=web-builder /web/dist ./apps/web/dist
-RUN pip install --no-cache-dir ".[production]"
+RUN uv sync --frozen --no-dev --extra production
 
 RUN useradd --create-home --uid 10001 runguard \
     && mkdir -p /data \

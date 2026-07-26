@@ -14,6 +14,7 @@ from fastapi import Request
 from jwt import PyJWKClient
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import JSONResponse, Response
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .config import Settings
 
@@ -34,6 +35,66 @@ ROLE_GRANTS = {
 }
 
 
+class RequestBodyLimitMiddleware:
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+    ) -> None:
+        if scope["type"] != "http" or scope.get("method") not in {
+            "POST",
+            "PUT",
+            "PATCH",
+        }:
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers", []))
+        try:
+            content_length = int(headers.get(b"content-length", b"0"))
+        except ValueError:
+            content_length = self.max_bytes + 1
+        if content_length > self.max_bytes:
+            await self._reject(scope, receive, send)
+            return
+
+        received = 0
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise _RequestBodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except _RequestBodyTooLarge:
+            await self._reject(scope, receive, send)
+
+    @staticmethod
+    async def _reject(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            {"detail": "Request body exceeds the configured limit."},
+            status_code=413,
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+        await response(scope, receive, send)
+
+
+class _RequestBodyTooLarge(Exception):
+    pass
+
+
 class RateLimiter:
     def __init__(self, redis_url: str | None, limit: int) -> None:
         self.redis_url = redis_url
@@ -47,7 +108,13 @@ class RateLimiter:
             return
         from redis.asyncio import Redis
 
-        self._client = Redis.from_url(self.redis_url, decode_responses=True)
+        self._client = Redis.from_url(
+            self.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            health_check_interval=30,
+        )
         await self._client.ping()
 
     async def close(self) -> None:
@@ -246,6 +313,17 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             request_id = uuid4().hex
         required = required_role(request)
         context = AuthContext("public", frozenset(), "public")
+        if request.url.path == "/api/alerts/prometheus":
+            try:
+                verify_webhook_signature(
+                    self.manager.settings.prometheus_webhook_secret,
+                    await request.body(),
+                    request.headers.get("x-runguard-signature"),
+                    request.headers.get("x-runguard-timestamp"),
+                )
+            except PermissionError as exc:
+                return self._error(401, str(exc), request_id)
+            request.state.webhook_verified = True
         if required:
             try:
                 context = await self.manager.authenticate(request)

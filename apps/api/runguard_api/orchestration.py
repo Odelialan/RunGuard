@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Literal, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -33,7 +33,7 @@ class RemediationPlan(BaseModel):
 
 
 class ReviewDecision(BaseModel):
-    decision: str
+    decision: Literal["approve", "deny", "require_human_approval"]
     reason: str
     concerns: list[str] = Field(default_factory=list)
 

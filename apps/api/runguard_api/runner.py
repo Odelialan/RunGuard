@@ -10,6 +10,55 @@ ALLOWED_TOOLS = {
     "kubernetes.rollout_restart",
 }
 
+ALLOWED_ARGUMENTS = {
+    "kubernetes.patch_deployment": {
+        "service",
+        "environment",
+        "namespace",
+        "name",
+        "container",
+        "memory_limit",
+        "cpu_limit",
+        "expected_resource_version",
+        "idempotency_key",
+    },
+    "kubernetes.scale_deployment": {
+        "service",
+        "environment",
+        "namespace",
+        "name",
+        "replicas",
+        "expected_resource_version",
+        "idempotency_key",
+    },
+    "kubernetes.rollout_restart": {
+        "service",
+        "environment",
+        "namespace",
+        "name",
+        "expected_resource_version",
+        "idempotency_key",
+    },
+}
+
+LAST_EXECUTION_ANNOTATION = "runguard.io/last-execution"
+LAST_BEFORE_ANNOTATION = "runguard.io/last-before-snapshot"
+
+
+def _replayed_before(annotations: dict[str, str], idempotency_key: str) -> dict[str, Any] | None:
+    if annotations.get(LAST_EXECUTION_ANNOTATION) != idempotency_key:
+        return None
+    raw = annotations.get(LAST_BEFORE_ANNOTATION)
+    if not raw:
+        raise RuntimeError("Idempotent replay found no durable pre-change snapshot.")
+    try:
+        before = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Idempotent replay found an invalid pre-change snapshot.") from exc
+    if not isinstance(before, dict):
+        raise RuntimeError("Idempotent replay found a non-object pre-change snapshot.")
+    return before
+
 
 def _load_kubernetes() -> tuple[Any, Any]:
     from kubernetes import client, config
@@ -23,38 +72,60 @@ def _patch_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
     name = arguments["name"]
     deployment = api.read_namespaced_deployment(name, namespace)
     annotations = deployment.spec.template.metadata.annotations or {}
-    if annotations.get("runguard.io/last-execution") == arguments["idempotency_key"]:
+    replayed_before = _replayed_before(annotations, arguments["idempotency_key"])
+    if replayed_before is not None:
         return {
-            "before": {},
-            "after": {},
+            "before": replayed_before,
+            "after": {
+                key: value
+                for key, value in arguments.items()
+                if key in {"container", "memory_limit", "cpu_limit"}
+            },
             "resource_version": deployment.metadata.resource_version,
             "idempotent_replay": True,
         }
     container_name = arguments.get("container") or deployment.spec.template.spec.containers[0].name
-    before: dict[str, Any] = {}
+    before: dict[str, Any] = {"container": container_name}
     patch: dict[str, Any] = {
         "spec": {
             "template": {
                 "metadata": {
-                    "annotations": {"runguard.io/last-execution": arguments["idempotency_key"]}
+                    "annotations": {}
                 },
                 "spec": {"containers": []},
             }
         }
     }
+    if arguments.get("expected_resource_version"):
+        patch["metadata"] = {
+            "resourceVersion": arguments["expected_resource_version"]
+        }
     container_patch: dict[str, Any] = {"name": container_name}
+    found_container = False
     for container in deployment.spec.template.spec.containers:
         if container.name == container_name:
-            resources = container.resources
-            before["memory_limit"] = (resources.limits or {}).get("memory")
-            before["cpu_limit"] = (resources.limits or {}).get("cpu")
-            limits = dict(resources.limits or {})
-            if arguments.get("memory_limit"):
-                limits["memory"] = arguments["memory_limit"]
-            if arguments.get("cpu_limit"):
-                limits["cpu"] = arguments["cpu_limit"]
+            found_container = True
+            limits = dict(getattr(container.resources, "limits", None) or {})
+            before["memory_limit"] = limits.get("memory")
+            before["cpu_limit"] = limits.get("cpu")
+            if "memory_limit" in arguments:
+                if arguments["memory_limit"] is None:
+                    limits.pop("memory", None)
+                else:
+                    limits["memory"] = arguments["memory_limit"]
+            if "cpu_limit" in arguments:
+                if arguments["cpu_limit"] is None:
+                    limits.pop("cpu", None)
+                else:
+                    limits["cpu"] = arguments["cpu_limit"]
             container_patch["resources"] = {"limits": limits}
             break
+    if not found_container:
+        raise ValueError(f"Container {container_name!r} does not exist in Deployment {name!r}.")
+    patch["spec"]["template"]["metadata"]["annotations"] = {
+        LAST_EXECUTION_ANNOTATION: arguments["idempotency_key"],
+        LAST_BEFORE_ANNOTATION: json.dumps(before, separators=(",", ":")),
+    }
     patch["spec"]["template"]["spec"]["containers"].append(container_patch)
     result = api.patch_namespaced_deployment(name, namespace, patch)
     return {
@@ -72,33 +143,34 @@ def _scale_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
     name = arguments["name"]
     deployment = api.read_namespaced_deployment(name, namespace)
     annotations = deployment.metadata.annotations or {}
-    if annotations.get("runguard.io/last-execution") == arguments["idempotency_key"]:
+    replayed_before = _replayed_before(annotations, arguments["idempotency_key"])
+    if replayed_before is not None:
         return {
-            "before": {"replicas": deployment.spec.replicas},
+            "before": replayed_before,
             "after": {"replicas": deployment.spec.replicas},
             "resource_version": deployment.metadata.resource_version,
             "idempotent_replay": True,
         }
-    current = api.read_namespaced_deployment_scale(name, namespace)
+    before = {"replicas": deployment.spec.replicas}
     replicas = int(arguments["replicas"])
-    result = api.patch_namespaced_deployment_scale(
-        name,
-        namespace,
-        {"spec": {"replicas": replicas}},
-    )
-    api.patch_namespaced_deployment(
-        name,
-        namespace,
-        {
-            "metadata": {
-                "annotations": {
-                    "runguard.io/last-execution": arguments["idempotency_key"]
-                }
+    scale_patch: dict[str, Any] = {
+        "metadata": {
+            "annotations": {
+                LAST_EXECUTION_ANNOTATION: arguments["idempotency_key"],
+                LAST_BEFORE_ANNOTATION: json.dumps(before, separators=(",", ":")),
             }
         },
+        "spec": {"replicas": replicas},
+    }
+    if arguments.get("expected_resource_version"):
+        scale_patch["metadata"]["resourceVersion"] = arguments["expected_resource_version"]
+    result = api.patch_namespaced_deployment(
+        name,
+        namespace,
+        scale_patch,
     )
     return {
-        "before": {"replicas": current.spec.replicas},
+        "before": before,
         "after": {"replicas": result.spec.replicas},
         "resource_version": result.metadata.resource_version,
     }
@@ -111,7 +183,7 @@ def _restart_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
     name = arguments["name"]
     deployment = api.read_namespaced_deployment(name, namespace)
     annotations = deployment.spec.template.metadata.annotations or {}
-    if annotations.get("runguard.io/last-execution") == arguments["idempotency_key"]:
+    if annotations.get(LAST_EXECUTION_ANNOTATION) == arguments["idempotency_key"]:
         return {
             "before": {},
             "after": {},
@@ -119,23 +191,26 @@ def _restart_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
             "idempotent_replay": True,
         }
     restarted_at = datetime.now(UTC).isoformat()
-    result = api.patch_namespaced_deployment(
-        name,
-        namespace,
-        {
-            "spec": {
-                "template": {
-                    "metadata": {
-                        "annotations": {
-                            "kubectl.kubernetes.io/restartedAt": restarted_at,
-                            "runguard.io/last-execution": arguments[
-                                "idempotency_key"
-                            ],
-                        }
+    patch: dict[str, Any] = {
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "kubectl.kubernetes.io/restartedAt": restarted_at,
+                        LAST_EXECUTION_ANNOTATION: arguments["idempotency_key"],
                     }
                 }
             }
-        },
+        }
+    }
+    if arguments.get("expected_resource_version"):
+        patch["metadata"] = {
+            "resourceVersion": arguments["expected_resource_version"]
+        }
+    result = api.patch_namespaced_deployment(
+        name,
+        namespace,
+        patch,
     )
     return {
         "before": {},
@@ -152,6 +227,18 @@ def run() -> int:
         return 2
     _, api = _load_kubernetes()
     arguments = dict(payload["arguments"])
+    unexpected = set(arguments) - ALLOWED_ARGUMENTS[tool]
+    if unexpected:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "Unsupported executor arguments: "
+                    + ", ".join(sorted(unexpected)),
+                }
+            )
+        )
+        return 4
     allowed_namespaces = {
         item.strip()
         for item in os.getenv("RUNGUARD_ALLOWED_NAMESPACES", "").split(",")

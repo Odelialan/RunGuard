@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -23,6 +27,7 @@ class Settings:
     redis_stream: str
     cors_origins: tuple[str, ...]
     cors_origin_regex: str
+    public_base_url: str | None
     execution_mode: str
     connector_mode: str
     mcp_prometheus_url: str | None
@@ -42,6 +47,7 @@ class Settings:
     kubernetes_context: str | None
     kubernetes_namespace: str
     kubernetes_allowed_namespaces: tuple[str, ...]
+    target_inventory_json: str
     kubernetes_runner_image: str
     kubernetes_service_account: str
     kubernetes_job_timeout_seconds: int
@@ -66,6 +72,7 @@ class Settings:
     oidc_algorithms: tuple[str, ...]
     oidc_roles_claim: str
     rate_limit_per_minute: int
+    max_request_body_bytes: int
     prometheus_webhook_secret: str | None
     langgraph_checkpoint_backend: str
     langgraph_checkpoint_encryption_key: str | None
@@ -112,6 +119,7 @@ def load_settings() -> Settings:
                 r"(:\d+)?$"
             ),
         ),
+        public_base_url=os.getenv("RUNGUARD_PUBLIC_BASE_URL") or None,
         execution_mode=os.getenv("RUNGUARD_EXECUTION_MODE", "simulation"),
         connector_mode=os.getenv("RUNGUARD_CONNECTOR_MODE", "mock"),
         mcp_prometheus_url=os.getenv("RUNGUARD_MCP_PROMETHEUS_URL") or None,
@@ -135,8 +143,9 @@ def load_settings() -> Settings:
             for namespace in allowed_namespaces.split(",")
             if namespace.strip()
         ),
+        target_inventory_json=os.getenv("RUNGUARD_TARGET_INVENTORY_JSON", "{}"),
         kubernetes_runner_image=os.getenv(
-            "RUNGUARD_KUBERNETES_RUNNER_IMAGE", "ghcr.io/odelialan/runguard-runner:1.2.0"
+            "RUNGUARD_KUBERNETES_RUNNER_IMAGE", "ghcr.io/odelialan/runguard-runner:1.2.1"
         ),
         kubernetes_service_account=os.getenv(
             "RUNGUARD_KUBERNETES_SERVICE_ACCOUNT", "runguard-executor"
@@ -171,6 +180,9 @@ def load_settings() -> Settings:
         ),
         oidc_roles_claim=os.getenv("RUNGUARD_OIDC_ROLES_CLAIM", "roles"),
         rate_limit_per_minute=int(os.getenv("RUNGUARD_RATE_LIMIT_PER_MINUTE", "120")),
+        max_request_body_bytes=int(
+            os.getenv("RUNGUARD_MAX_REQUEST_BODY_BYTES", "1048576")
+        ),
         prometheus_webhook_secret=os.getenv("RUNGUARD_PROMETHEUS_WEBHOOK_SECRET") or None,
         langgraph_checkpoint_backend=os.getenv(
             "RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND",
@@ -179,12 +191,13 @@ def load_settings() -> Settings:
         langgraph_checkpoint_encryption_key=os.getenv("LANGGRAPH_AES_KEY") or None,
         auto_recover=_bool("RUNGUARD_AUTO_RECOVER", False),
         recovery_concurrency=int(os.getenv("RUNGUARD_RECOVERY_CONCURRENCY", "4")),
-        prompt_version=os.getenv("RUNGUARD_PROMPT_VERSION", "1.2.0"),
-        policy_version=os.getenv("RUNGUARD_POLICY_VERSION", "1.2.0"),
+        prompt_version=os.getenv("RUNGUARD_PROMPT_VERSION", "1.2.1"),
+        policy_version=os.getenv("RUNGUARD_POLICY_VERSION", "1.2.1"),
     )
 
 
 def validate_settings(settings: Settings) -> None:
+    inventory = parse_target_inventory(settings.target_inventory_json)
     if settings.auth_mode not in {"disabled", "api_key", "oidc"}:
         raise RuntimeError("RUNGUARD_AUTH_MODE must be disabled, api_key, or oidc.")
     if settings.connector_mode not in {"mock", "hybrid", "production", "mcp"}:
@@ -195,6 +208,10 @@ def validate_settings(settings: Settings) -> None:
         )
     if settings.recovery_concurrency < 1 or settings.recovery_concurrency > 32:
         raise RuntimeError("RUNGUARD_RECOVERY_CONCURRENCY must be between 1 and 32.")
+    if not 1024 <= settings.max_request_body_bytes <= 10 * 1024 * 1024:
+        raise RuntimeError(
+            "RUNGUARD_MAX_REQUEST_BODY_BYTES must be between 1024 and 10485760."
+        )
     if not (
         1
         <= settings.database_pool_min_size
@@ -230,6 +247,17 @@ def validate_settings(settings: Settings) -> None:
         raise RuntimeError(
             "RUNGUARD_KUBERNETES_NAMESPACE must be included in the allowed namespace list."
         )
+    for service, target in inventory.items():
+        if target["namespace"] not in settings.kubernetes_allowed_namespaces:
+            raise RuntimeError(
+                f"Target inventory service {service!r} uses a namespace outside the allowlist."
+            )
+    if settings.environment.strip().lower() in {"production", "prod"} and not (
+        settings.enforce_production_guards
+    ):
+        raise RuntimeError(
+            "RUNGUARD_ENVIRONMENT=production requires RUNGUARD_ENFORCE_PRODUCTION_GUARDS=true."
+        )
     if not settings.enforce_production_guards:
         return
     required = {
@@ -248,10 +276,60 @@ def validate_settings(settings: Settings) -> None:
         raise RuntimeError("Production guards require an explicit CORS origin allowlist.")
     if any(not origin.startswith("https://") for origin in settings.cors_origins):
         raise RuntimeError("Production CORS origins must use HTTPS.")
+    if not settings.public_base_url:
+        raise RuntimeError("Production guards require RUNGUARD_PUBLIC_BASE_URL.")
+    public_url = urlsplit(settings.public_base_url)
+    if (
+        public_url.scheme != "https"
+        or not public_url.netloc
+        or public_url.username
+        or public_url.password
+        or public_url.path not in {"", "/"}
+        or public_url.query
+        or public_url.fragment
+    ):
+        raise RuntimeError(
+            "RUNGUARD_PUBLIC_BASE_URL must be an HTTPS origin without credentials or a path."
+        )
+    https_endpoints = {
+        "RUNGUARD_OIDC_ISSUER": (
+            settings.oidc_issuer if settings.auth_mode == "oidc" else None
+        ),
+        "RUNGUARD_OIDC_JWKS_URL": (
+            settings.oidc_jwks_url if settings.auth_mode == "oidc" else None
+        ),
+        "RUNGUARD_MCP_PROMETHEUS_URL": settings.mcp_prometheus_url,
+        "RUNGUARD_MCP_LOKI_URL": settings.mcp_loki_url,
+        "RUNGUARD_MCP_KUBERNETES_URL": settings.mcp_kubernetes_url,
+        "RUNGUARD_MCP_GITHUB_URL": settings.mcp_github_url,
+        "RUNGUARD_A2A_REVIEWER_URL": settings.a2a_reviewer_url,
+        "RUNGUARD_LLM_BASE_URL": settings.llm_base_url,
+        "RUNGUARD_VERIFICATION_URL_TEMPLATE": settings.verification_url_template,
+    }
+    for name, value in https_endpoints.items():
+        if not value:
+            continue
+        endpoint = urlsplit(value)
+        if (
+            endpoint.scheme != "https"
+            or not endpoint.netloc
+            or endpoint.username
+            or endpoint.password
+        ):
+            raise RuntimeError(
+                f"{name} must use HTTPS and must not contain URL credentials "
+                "when production guards are enabled."
+            )
     if settings.policy_backend != "opa":
         raise RuntimeError("Production guards require the OPA policy backend.")
+    if not settings.opa_fail_closed:
+        raise RuntimeError("Production guards require RUNGUARD_OPA_FAIL_CLOSED=true.")
     if settings.execution_mode != "kubernetes_job":
         raise RuntimeError("Production guards require restricted Kubernetes Job execution.")
+    if not re.search(r"@sha256:[0-9a-f]{64}$", settings.kubernetes_runner_image):
+        raise RuntimeError(
+            "Production guards require RUNGUARD_KUBERNETES_RUNNER_IMAGE pinned by SHA-256 digest."
+        )
     if settings.connector_mode not in {"production", "mcp"}:
         raise RuntimeError("Production guards require production or MCP connectors.")
     if settings.connector_mode == "production":
@@ -282,3 +360,61 @@ def validate_settings(settings: Settings) -> None:
         raise RuntimeError("Production guards require the PostgreSQL LangGraph checkpointer.")
     if not settings.auto_recover:
         raise RuntimeError("Production guards require RUNGUARD_AUTO_RECOVER=true.")
+    if not inventory:
+        raise RuntimeError("Production guards require RUNGUARD_TARGET_INVENTORY_JSON.")
+    for service, target in inventory.items():
+        if target["namespace"] != settings.kubernetes_namespace:
+            raise RuntimeError(
+                f"Production target {service!r} must be in the RunGuard release namespace."
+            )
+
+
+def parse_target_inventory(raw: str) -> dict[str, dict[str, str]]:
+    try:
+        value: Any = json.loads(raw or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("RUNGUARD_TARGET_INVENTORY_JSON is not valid JSON.") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("RUNGUARD_TARGET_INVENTORY_JSON must be a JSON object.")
+    inventory: dict[str, dict[str, str]] = {}
+    required = {"environment", "namespace", "name"}
+    for service, target in value.items():
+        if not isinstance(service, str) or not service.strip() or not isinstance(target, dict):
+            raise RuntimeError("Every target inventory entry must map a service to an object.")
+        service = service.strip()
+        if (
+            len(service) > 253
+            or not re.fullmatch(
+                r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+                r"(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*",
+                service,
+            )
+        ):
+            raise RuntimeError(f"Target inventory has an invalid service key {service!r}.")
+        if service in inventory:
+            raise RuntimeError(f"Target inventory contains duplicate service {service!r}.")
+        normalized = {
+            field: str(target.get(field, "")).strip()
+            for field in required
+        }
+        if not all(normalized.values()):
+            raise RuntimeError(
+                f"Target inventory service {service!r} requires environment, namespace, and name."
+            )
+        for field in ("namespace", "name"):
+            if len(normalized[field]) > 253 or not re.fullmatch(
+                r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
+                r"(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*",
+                normalized[field],
+            ):
+                raise RuntimeError(
+                    f"Target inventory service {service!r} has an invalid {field}."
+                )
+        environment = normalized["environment"].lower()
+        normalized["environment"] = {
+            "prod": "production",
+            "stage": "staging",
+            "dev": "development",
+        }.get(environment, environment)
+        inventory[service] = normalized
+    return inventory

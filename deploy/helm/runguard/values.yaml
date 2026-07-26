@@ -2,12 +2,14 @@ replicaCount: 2
 
 image:
   repository: ghcr.io/odelialan/runguard
-  tag: "1.2.0"
+  tag: "1.2.1"
+  digest: ""
   pullPolicy: IfNotPresent
 
 runnerImage:
   repository: ghcr.io/odelialan/runguard-runner
-  tag: "1.2.0"
+  tag: "1.2.1"
+  digest: ""
 
 service:
   type: ClusterIP
@@ -44,11 +46,14 @@ config:
   llmModel: gpt-5-mini
   verificationUrlTemplate: ""
   allowedNamespaces: ""
+  targetInventory: {}
   checkpointBackend: postgres
   autoRecover: true
   recoveryConcurrency: 4
   corsOrigins: https://runguard.example.com
   corsOriginRegex: ""
+  publicBaseUrl: https://runguard.example.com
+  maxRequestBodyBytes: 1048576
 
 auth:
   mode: oidc

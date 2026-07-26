@@ -18,8 +18,16 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.cache/
+.uv-cache/
 .coverage
+.coverage.*
 htmlcov/
+coverage*.xml
+junit*.xml
 *.egg-info/
 
 # JavaScript dependencies and build outputs
@@ -69,6 +77,13 @@ artifacts/
 *.safetensors
 *.bin
 *.parquet
+*.pdf
+*.psd
+*.blend
+*.prof
+*.trace
+*.dump
+*.bak
 
 # Local notes and temporary test material
 notes/
@@ -76,8 +91,11 @@ scratch/
 tmp/
 temp/
 docs/drafts/
+docs/private/
 *_local.md
 *.local.md
+*_prd.md
+prd_local.*
 
 # Editors and operating systems
 .idea/

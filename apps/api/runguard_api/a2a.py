@@ -16,7 +16,7 @@ def reviewer_agent_card(base_url: str) -> dict[str, Any]:
         "additionalInterfaces": [
             {"url": f"{base_url.rstrip('/')}/a2a/reviewer", "transport": "JSONRPC"}
         ],
-        "version": "1.2.0",
+        "version": "1.2.1",
         "capabilities": {"streaming": False, "pushNotifications": False},
         "defaultInputModes": ["application/json", "text/plain"],
         "defaultOutputModes": ["application/json", "text/plain"],
@@ -33,8 +33,14 @@ def reviewer_agent_card(base_url: str) -> dict[str, Any]:
                 "outputModes": ["application/json"],
             }
         ],
-        "securitySchemes": {},
-        "security": [],
+        "securitySchemes": {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "description": "RunGuard service bearer token.",
+            }
+        },
+        "security": [{"bearerAuth": []}],
     }
 
 

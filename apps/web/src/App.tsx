@@ -1017,7 +1017,7 @@ function IncidentWorkspace({
         <aside className="workspace-side">
           <div className="panel run-summary">
             <PanelHeader title="Run telemetry" subtitle={latestRun?.id ?? "No run started"} />
-            <SummaryStat icon={Sparkles} label="Prompt version" value={latestRun?.prompt_version ?? "1.2.0"} />
+            <SummaryStat icon={Sparkles} label="Prompt version" value={latestRun?.prompt_version ?? "1.2.1"} />
             <SummaryStat icon={Code2} label="Tokens" value={formatNumber(latestRun?.token_usage ?? 0)} />
             <SummaryStat icon={TerminalSquare} label="Tool calls" value={String(latestRun?.tool_calls ?? 0)} />
             <SummaryStat
@@ -1579,7 +1579,7 @@ function EvaluationDashboard({
             <BarChart3 size={14} /> RELIABILITY EVALUATION
           </div>
           <h1>Evaluation dashboard</h1>
-          <p>Measured results from fixed, reproducible fault scenarios — never self-reported claims.</p>
+          <p>Reference expectations from fixed deterministic fixtures, not production measurements.</p>
         </div>
         <button className="primary-button" onClick={() => void runSuite()} disabled={busy}>
           {busy ? <RefreshCcw size={16} className="spin" /> : <Play size={16} />}
@@ -1592,7 +1592,7 @@ function EvaluationDashboard({
             <BarChart3 size={34} />
           </div>
           <h2>Establish the v1.0 baseline</h2>
-          <p>Run 12 deterministic scenarios to measure diagnosis, policy, and recovery behavior.</p>
+          <p>Load 12 deterministic fixtures to inspect expected diagnosis and policy behavior.</p>
           <button className="primary-button" onClick={() => void runSuite()} disabled={busy}>
             Run evaluation
           </button>
@@ -1622,7 +1622,7 @@ function EvaluationDashboard({
                 <span>BASELINE SCORE</span>
                 <h2>Trusted response quality</h2>
                 <p>
-                  Deterministic simulation · prompt {latest.prompt_version} · {latest.cases.length}{" "}
+                  Static fixture · prompt {latest.prompt_version} · {latest.cases.length}{" "}
                   fixed cases
                 </p>
               </div>
@@ -1695,13 +1695,13 @@ function EvaluationDashboard({
               </div>
               <div className="panel measured-note">
                 <Fingerprint size={25} />
-                <strong>Measured, scoped, reproducible</strong>
+                <strong>Reference fixture — not measured</strong>
                 <p>
-                  These numbers describe the bundled deterministic simulation only. They are not
-                  claims about a production cluster.
+                  These values are bundled expectations for UI and policy-contract demonstrations.
+                  They do not execute a model, Kubernetes fault, or worker-recovery experiment.
                 </p>
                 <span>
-                  <Check size={13} /> Dataset versioned with v1.0
+                  <Check size={13} /> Fixture versioned with the repository
                 </span>
               </div>
             </aside>
@@ -1781,13 +1781,14 @@ function PostmortemPage({
             {document ? "Regenerate" : "Generate report"}
           </button>
           {document && (
-            <a
+            <button
               className="primary-button postmortem-export"
-              href={`/api/incidents/${document.incident_id}/postmortem/export`}
+              type="button"
+              onClick={() => void api.exportPostmortem(document.incident_id)}
             >
               <FileText size={15} />
               Export Markdown
-            </a>
+            </button>
           )}
         </div>
       </div>
@@ -1902,6 +1903,7 @@ function PolicySimulator({ showToast }: { showToast: (toast: Toast) => void }) {
           resource: "order-api",
           risk_level: risk,
           has_rollback: rollback,
+          rollback: rollback ? { memory_limit: "256Mi" } : {},
           incident_severity: "P1",
         }),
       );
@@ -1919,7 +1921,7 @@ function PolicySimulator({ showToast }: { showToast: (toast: Toast) => void }) {
           <h1>Policy simulator</h1>
           <p>Preview the exact decision before an Agent intent enters the execution path.</p>
         </div>
-        <span className="version-chip">policy · 1.2.0 · active</span>
+        <span className="version-chip">policy · 1.2.1 · active</span>
       </section>
       <section className="policy-layout">
         <div className="panel policy-form">
@@ -1977,6 +1979,7 @@ function PolicySimulator({ showToast }: { showToast: (toast: Toast) => void }) {
     resource: "order-api",
     risk_level: risk,
     has_rollback: rollback,
+    rollback: rollback ? { memory_limit: "256Mi" } : {},
     incident_severity: "P1",
   },
   null,

@@ -35,6 +35,8 @@ data:
   RUNGUARD_RECOVERY_CONCURRENCY: {{ .Values.config.recoveryConcurrency | quote }}
   RUNGUARD_CORS_ORIGINS: {{ .Values.config.corsOrigins | quote }}
   RUNGUARD_CORS_ORIGIN_REGEX: {{ .Values.config.corsOriginRegex | quote }}
+  RUNGUARD_PUBLIC_BASE_URL: {{ if .Values.config.enforceProductionGuards }}{{ required "config.publicBaseUrl is required in production" .Values.config.publicBaseUrl | quote }}{{ else }}{{ .Values.config.publicBaseUrl | default "" | quote }}{{ end }}
+  RUNGUARD_MAX_REQUEST_BODY_BYTES: {{ .Values.config.maxRequestBodyBytes | int | quote }}
   RUNGUARD_AUTH_MODE: {{ .Values.auth.mode | quote }}
   RUNGUARD_OIDC_ISSUER: {{ if eq .Values.auth.mode "oidc" }}{{ required "auth.oidcIssuer is required for OIDC" .Values.auth.oidcIssuer | quote }}{{ else }}""{{ end }}
   RUNGUARD_OIDC_AUDIENCE: {{ if eq .Values.auth.mode "oidc" }}{{ required "auth.oidcAudience is required for OIDC" .Values.auth.oidcAudience | quote }}{{ else }}""{{ end }}
@@ -44,5 +46,6 @@ data:
   RUNGUARD_RATE_LIMIT_PER_MINUTE: {{ .Values.auth.rateLimitPerMinute | quote }}
   RUNGUARD_KUBERNETES_NAMESPACE: {{ .Release.Namespace | quote }}
   RUNGUARD_KUBERNETES_ALLOWED_NAMESPACES: {{ .Values.config.allowedNamespaces | default .Release.Namespace | quote }}
+  RUNGUARD_TARGET_INVENTORY_JSON: {{ if .Values.config.enforceProductionGuards }}{{ required "config.targetInventory is required in production" .Values.config.targetInventory | toJson | quote }}{{ else }}{{ .Values.config.targetInventory | default dict | toJson | quote }}{{ end }}
   RUNGUARD_KUBERNETES_SERVICE_ACCOUNT: {{ .Values.executorServiceAccount.name | quote }}
-  RUNGUARD_KUBERNETES_RUNNER_IMAGE: {{ printf "%s:%s" .Values.runnerImage.repository .Values.runnerImage.tag | quote }}
+  RUNGUARD_KUBERNETES_RUNNER_IMAGE: {{ if .Values.config.enforceProductionGuards }}{{ printf "%s@%s" .Values.runnerImage.repository (required "runnerImage.digest is required in production" .Values.runnerImage.digest) | quote }}{{ else }}{{ printf "%s:%s" .Values.runnerImage.repository .Values.runnerImage.tag | quote }}{{ end }}

@@ -52,8 +52,12 @@ def run_baseline(store: Store, payload: EvalRunRequest) -> dict[str, object]:
         "average_tool_calls": 7.5,
         "p50_duration_seconds": 12.9,
         "p95_duration_seconds": 16.4,
-        "measured": True,
-        "execution_mode": "deterministic simulation",
+        "measured": False,
+        "execution_mode": "static deterministic fixture",
+        "scope_statement": (
+            "Reference expectations only; this run does not execute a model, fault injector, "
+            "worker recovery, or Kubernetes mutation."
+        ),
     }
     return store.record_eval_run(
         payload.suite,

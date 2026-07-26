@@ -28,7 +28,7 @@ requests_total = Counter("fault_injector_requests_total", "Requests", ["outcome"
 latency = Histogram("fault_injector_request_duration_seconds", "Injected request duration")
 fault_active = Gauge("fault_injector_active", "Whether a fault is active", ["fault"])
 
-app = FastAPI(title="RunGuard Fault Injector", version="1.2.0")
+app = FastAPI(title="RunGuard Fault Injector", version="1.2.1")
 
 
 def _authorize(token: str | None) -> None:
@@ -52,7 +52,8 @@ async def workload() -> dict[str, object]:
     with latency.time():
         if state.latency_ms:
             await asyncio.sleep(state.latency_ms / 1000)
-        if state.unhealthy or random.random() < state.error_rate:
+        # This is workload fault simulation, not a security-sensitive random choice.
+        if state.unhealthy or random.random() < state.error_rate:  # nosec B311
             requests_total.labels(outcome="error").inc()
             raise HTTPException(status_code=503, detail="Injected service failure.")
         requests_total.labels(outcome="ok").inc()

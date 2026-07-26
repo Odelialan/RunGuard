@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
-from typing import Any
+from collections.abc import Callable
+from typing import Any, ParamSpec, TypeVar
+from weakref import WeakValueDictionary
 
 import httpx
 
-from .config import Settings
+from .config import Settings, parse_target_inventory
 from .embeddings import EvidenceIndexer
-from .event_stream import EventStream
+from .event_stream import EventStream, LockLeaseLost, LockUnavailable
 from .gateway import ToolContext, build_transport
 from .models import IncidentStatus, PolicySimulationRequest
 from .orchestration import LangGraphOrchestrator
-from .policy import PolicyEvaluator, classify_risk
+from .policy import PolicyEvaluator, classify_risk, has_effective_rollback
 from .postmortem import PostmortemService
 from .store import Store
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 class WorkflowLocked(ValueError):
@@ -42,8 +48,18 @@ class IncidentEngine:
         self.orchestrator = (
             LangGraphOrchestrator(settings) if settings.agent_backend == "langgraph" else None
         )
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._recovery_task: asyncio.Task[None] | None = None
+        self.target_inventory = parse_target_inventory(settings.target_inventory_json)
+
+    async def _db(
+        self,
+        method: Callable[P, R],
+        /,
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> R:
+        return await asyncio.to_thread(method, *args, **kwargs)
 
     async def connect(self) -> None:
         if self.orchestrator:
@@ -75,10 +91,11 @@ class IncidentEngine:
                 except WorkflowLocked:
                     return
                 except Exception as exc:
-                    incident = self.store.get_incident(incident_id)
+                    incident = await self._db(self.store.get_incident, incident_id)
                     run_id = incident.get("current_run_id")
                     if run_id:
-                        self.store.add_trace(
+                        await self._db(
+                            self.store.add_trace,
                             run_id,
                             incident_id,
                             "recovery",
@@ -88,35 +105,39 @@ class IncidentEngine:
                             0,
                             {"error": str(exc)},
                         )
-                    self.store.update_status(
+                    await self._db(
+                        self.store.update_status,
                         incident_id,
                         IncidentStatus.HUMAN_HANDOFF,
                         "recovery-controller",
                         {"reason": "Automatic recovery failed closed."},
                     )
 
-        await asyncio.gather(
-            *(recover_one(incident_id) for incident_id in self.store.list_recoverable_incidents())
-        )
+        recoverable = await self._db(self.store.list_recoverable_incidents)
+        await asyncio.gather(*(recover_one(incident_id) for incident_id in recoverable))
 
     async def start(self, incident_id: str) -> dict[str, Any]:
-        lock_name = f"incident:{incident_id}"
-        token = await self.event_stream.acquire_lock(lock_name)
-        if token is None:
-            raise WorkflowLocked("Incident workflow is already active on another worker.")
         try:
-            return await self._start_unlocked(incident_id)
-        finally:
-            await self.event_stream.release_lock(lock_name, token)
+            return await self.event_stream.run_with_lock(
+                f"incident:{incident_id}",
+                1800,
+                lambda: self._start_unlocked(incident_id),
+            )
+        except (LockUnavailable, LockLeaseLost) as exc:
+            raise WorkflowLocked(
+                "Incident workflow lock is unavailable or its lease was lost."
+            ) from exc
 
     async def _start_unlocked(self, incident_id: str) -> dict[str, Any]:
         lock = self._locks.setdefault(incident_id, asyncio.Lock())
         async with lock:
-            incident = self.store.get_incident(incident_id)
+            incident = await self._db(self.store.get_incident, incident_id)
             if incident["status"] not in {"NEW", "INVESTIGATING", "HUMAN_HANDOFF"}:
                 return incident
+            target = self._target_binding(incident)
 
-            run_id = self.store.create_run(
+            run_id = await self._db(
+                self.store.create_run,
                 incident_id,
                 self.settings.prompt_version,
                 graph_version=(
@@ -131,7 +152,7 @@ class IncidentEngine:
                     "model": self.settings.llm_model if self.orchestrator else "demo-v1",
                 },
             )
-            self._checkpoint(run_id, incident_id, "RUN_CREATED")
+            await self._checkpoint(run_id, incident_id, "RUN_CREATED")
             await self._transition(
                 incident_id,
                 IncidentStatus.TRIAGING,
@@ -152,8 +173,30 @@ class IncidentEngine:
                 1180,
             )
 
-            evidence_ids = await self._collect_evidence(incident, run_id)
-            self._checkpoint(
+            evidence_ids = await self._collect_evidence(incident, run_id, target)
+            current_evidence = (
+                await self._db(self.store.get_incident, incident_id)
+            )["evidence"]
+            successful_sources = {
+                item["source_type"]
+                for item in current_evidence
+                if item.get("metadata", {}).get("ok") is True
+            }
+            if len(successful_sources) < 2 or "kubernetes" not in successful_sources:
+                await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 4)
+                return await self._db(
+                    self.store.update_status,
+                    incident_id,
+                    IncidentStatus.HUMAN_HANDOFF,
+                    "investigator-agent",
+                    {
+                        "reason": (
+                            "Minimum evidence quorum was not met; Kubernetes evidence and "
+                            "one independent source are required."
+                        )
+                    },
+                )
+            await self._checkpoint(
                 run_id,
                 incident_id,
                 "EVIDENCE_COLLECTED",
@@ -162,20 +205,21 @@ class IncidentEngine:
             graph_output: dict[str, Any] | None = None
             if self.orchestrator:
                 try:
-                    enriched = self.store.get_incident(incident_id)
+                    enriched = await self._db(self.store.get_incident, incident_id)
                     graph_output = await self.orchestrator.run(
                         enriched,
                         enriched["evidence"],
                         run_id,
                     )
-                    self._checkpoint(
+                    await self._checkpoint(
                         run_id,
                         incident_id,
                         "LANGGRAPH_COMPLETED",
                         await self.orchestrator.checkpoint(run_id) or {},
                     )
                 except Exception as exc:
-                    self.store.add_trace(
+                    await self._db(
+                        self.store.add_trace,
                         run_id,
                         incident_id,
                         "llm",
@@ -185,8 +229,11 @@ class IncidentEngine:
                         0,
                         {"error": str(exc)},
                     )
-                    self.store.finish_run(run_id, "HUMAN_HANDOFF", 0, 4)
-                    return self.store.update_status(
+                    await self._db(
+                        self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 4
+                    )
+                    return await self._db(
+                        self.store.update_status,
                         incident_id,
                         IncidentStatus.HUMAN_HANDOFF,
                         "orchestrator",
@@ -196,8 +243,25 @@ class IncidentEngine:
             cause = investigation.get("root_cause") or self._infer_cause(incident)
             confidence = float(investigation.get("confidence", 0.91))
             linked_evidence = investigation.get("evidence_ids") or evidence_ids
-            self.store.add_hypothesis(incident_id, cause, confidence, linked_evidence)
-            self.store.add_trace(
+            invalid_evidence = set(linked_evidence) - set(evidence_ids)
+            if invalid_evidence:
+                await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 4)
+                return await self._db(
+                    self.store.update_status,
+                    incident_id,
+                    IncidentStatus.HUMAN_HANDOFF,
+                    "investigator-agent",
+                    {"reason": "Investigation cited evidence outside this incident."},
+                )
+            await self._db(
+                self.store.add_hypothesis,
+                incident_id,
+                cause,
+                confidence,
+                linked_evidence,
+            )
+            await self._db(
+                self.store.add_trace,
                 run_id,
                 incident_id,
                 "llm",
@@ -224,39 +288,62 @@ class IncidentEngine:
             )
             remediation = (graph_output or {}).get("remediation", {})
             tool_name = remediation.get("tool_name", "kubernetes.patch_deployment")
-            target_namespace = self._target_namespace(incident["environment"])
-            arguments = {
-                "service": incident["service"],
-                "namespace": target_namespace,
-                "name": incident["service"],
-                **remediation.get("arguments", {"memory_limit": "1Gi"}),
-            }
-            rollback = {
-                "service": incident["service"],
-                "namespace": target_namespace,
-                "name": incident["service"],
-                **remediation.get("rollback", {"memory_limit": "256Mi"}),
-            }
+            try:
+                arguments = self._normalize_tool_arguments(
+                    tool_name,
+                    remediation.get("arguments", {"memory_limit": "1Gi"}),
+                    target,
+                )
+                rollback = self._normalize_tool_arguments(
+                    tool_name,
+                    remediation.get("rollback", {"memory_limit": "256Mi"}),
+                    target,
+                    rollback=True,
+                )
+                arguments, rollback = await self._capture_prechange_state(
+                    tool_name,
+                    arguments,
+                    target,
+                    incident,
+                    run_id,
+                )
+            except ValueError as exc:
+                await self._db(
+                    self.store.add_trace,
+                    run_id,
+                    incident_id,
+                    "policy",
+                    "intent.normalize",
+                    "policy-gateway",
+                    "ERROR",
+                    0,
+                    {"error": str(exc)},
+                )
+                await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 4)
+                return await self._db(
+                    self.store.update_status,
+                    incident_id,
+                    IncidentStatus.HUMAN_HANDOFF,
+                    "policy-gateway",
+                    {"reason": str(exc)},
+                )
             risk = classify_risk(
                 tool_name,
                 incident["environment"],
                 arguments,
             )
-            intent = self.store.create_intent(
+            intent = await self._db(
+                self.store.create_intent,
                 run_id=run_id,
                 incident_id=incident_id,
                 tool_name=tool_name,
                 environment=incident["environment"],
-                resource={
-                    "namespace": target_namespace,
-                    "kind": "Deployment",
-                    "name": incident["service"],
-                },
+                resource={**target, "kind": "Deployment"},
                 arguments=arguments,
                 rollback=rollback,
                 risk_level=str(risk),
             )
-            self._checkpoint(
+            await self._checkpoint(
                 run_id,
                 incident_id,
                 "INTENT_CREATED",
@@ -274,30 +361,63 @@ class IncidentEngine:
             policy_input = PolicySimulationRequest(
                 environment=incident["environment"],
                 tool=intent["tool_name"],
-                resource=incident["service"],
+                resource=intent["resource"],
+                arguments=intent["arguments"],
+                rollback=intent["rollback"],
                 risk_level=risk,
-                has_rollback=bool(intent["rollback"]),
+                has_rollback=self._has_effective_rollback(intent["rollback"]),
                 incident_severity=incident["severity"],
             ).model_dump(mode="json")
             decision = await self.policy.evaluate(policy_input)
             review = (graph_output or {}).get("review", {})
-            if str(review.get("decision", "")).lower() in {"deny", "rejected", "reject"}:
-                decision = {
-                    "decision": "deny",
-                    "risk_level": str(risk),
-                    "matched_policy": "independent-reviewer-denied",
-                    "reason": review.get("reason", "Independent reviewer rejected the plan."),
-                    "backend": (
-                        "a2a-reviewer" if self.settings.a2a_reviewer_url else "langgraph-reviewer"
-                    ),
-                }
-            self.store.record_policy(
+            if self.orchestrator:
+                review_decision = str(review.get("decision", "")).strip().lower()
+                reviewer_backend = (
+                    "a2a-reviewer"
+                    if self.settings.a2a_reviewer_url
+                    else "langgraph-reviewer"
+                )
+                if review_decision == "deny":
+                    decision = {
+                        "decision": "deny",
+                        "risk_level": str(risk),
+                        "matched_policy": "independent-reviewer-denied",
+                        "reason": review.get(
+                            "reason",
+                            "Independent reviewer rejected the plan.",
+                        ),
+                        "backend": reviewer_backend,
+                    }
+                elif (
+                    review_decision == "require_human_approval"
+                    and decision["decision"] != "deny"
+                ):
+                    decision = {
+                        "decision": "require_approval",
+                        "risk_level": str(risk),
+                        "matched_policy": "independent-reviewer-requires-human",
+                        "reason": review.get(
+                            "reason",
+                            "Independent reviewer requires a human approver.",
+                        ),
+                        "backend": reviewer_backend,
+                    }
+                elif review_decision != "approve":
+                    decision = {
+                        "decision": "deny",
+                        "risk_level": str(risk),
+                        "matched_policy": "independent-reviewer-invalid-fail-closed",
+                        "reason": "Independent reviewer returned no valid decision.",
+                        "backend": reviewer_backend,
+                    }
+            await self._db(
+                self.store.record_policy,
                 intent["id"],
                 self.settings.policy_version,
                 decision,
                 policy_input,
             )
-            self._checkpoint(
+            await self._checkpoint(
                 run_id,
                 incident_id,
                 "POLICY_DECIDED",
@@ -309,16 +429,18 @@ class IncidentEngine:
             )
 
             if decision["decision"] == "deny":
-                self.store.finish_run(run_id, "DENIED", 2860, 4)
-                self._checkpoint(run_id, incident_id, "DENIED")
-                return self.store.update_status(
+                await self._db(self.store.finish_run, run_id, "DENIED", 2860, 4)
+                await self._checkpoint(run_id, incident_id, "DENIED")
+                return await self._db(
+                    self.store.update_status,
                     incident_id,
                     IncidentStatus.DENIED,
                     "policy-gateway",
                     {"matched_policy": decision["matched_policy"]},
                 )
             if decision["decision"] == "require_approval":
-                self.store.add_trace(
+                await self._db(
+                    self.store.add_trace,
                     run_id,
                     incident_id,
                     "approval",
@@ -328,20 +450,24 @@ class IncidentEngine:
                     3,
                     {"tool_intent_id": intent["id"]},
                 )
-                self.store.finish_run(run_id, "WAITING_APPROVAL", 2860, 4)
-                self._checkpoint(
+                await self._db(
+                    self.store.finish_run, run_id, "WAITING_APPROVAL", 2860, 4
+                )
+                await self._checkpoint(
                     run_id,
                     incident_id,
                     "WAITING_APPROVAL",
                     {"tool_intent_id": intent["id"]},
                 )
-                return self.store.update_status(
+                return await self._db(
+                    self.store.update_status,
                     incident_id,
                     IncidentStatus.WAITING_APPROVAL,
                     "policy-gateway",
                     {"tool_intent_id": intent["id"]},
                 )
-            self.store.decide_approval(
+            await self._db(
+                self.store.decide_approval,
                 intent["id"],
                 "policy-gateway",
                 "approved",
@@ -350,20 +476,47 @@ class IncidentEngine:
             return await self.execute(intent["id"])
 
     async def execute(self, intent_id: str) -> dict[str, Any]:
-        intent = self.store.get_intent(intent_id)
-        incident = self.store.get_incident(intent["incident_id"])
+        intent = await self._db(self.store.get_intent, intent_id)
+        resource_lock_key = self._resource_lock_key(intent)
+        local_lock = self._locks.setdefault(resource_lock_key, asyncio.Lock())
+        async with local_lock:
+            try:
+                return await self.event_stream.run_with_lock(
+                    resource_lock_key,
+                    600,
+                    lambda: self._execute_unlocked(intent_id),
+                )
+            except (LockUnavailable, LockLeaseLost) as exc:
+                raise WorkflowLocked(
+                    "Target resource lock is unavailable or its lease was lost."
+                ) from exc
+
+    async def _execute_unlocked(self, intent_id: str) -> dict[str, Any]:
+        intent = await self._db(self.store.get_intent, intent_id)
+        incident = await self._db(self.store.get_incident, intent["incident_id"])
         if intent["status"] == "EXECUTED":
             return await self._verify_and_finalize(intent, incident)
-        if intent["status"] not in {"APPROVED", "PENDING"}:
-            raise ValueError(f"Tool intent is not executable: {intent['status']}")
+        if intent["status"] == "EXECUTION_FAILED":
+            await self._db(
+                self.store.finish_run, intent["run_id"], "HUMAN_HANDOFF", 0, 5
+            )
+            return await self._db(
+                self.store.update_status,
+                incident["id"],
+                IncidentStatus.HUMAN_HANDOFF,
+                "recovery-controller",
+                {"reason": "Recovered a recorded failed execution; no retry was attempted."},
+            )
+        intent = await self._db(self.store.claim_execution, intent_id)
         run_id = intent["run_id"]
-        self._checkpoint(
+        await self._checkpoint(
             run_id,
             incident["id"],
             "EXECUTION_STARTED",
             {"tool_intent_id": intent_id},
         )
-        self.store.update_status(
+        await self._db(
+            self.store.update_status,
             incident["id"],
             IncidentStatus.EXECUTING,
             "tool-gateway",
@@ -383,24 +536,27 @@ class IncidentEngine:
         runner_result = (
             result.data.get("runner_result", {}) if isinstance(result.data, dict) else {}
         )
-        before = runner_result.get("before") or {
-            key: value
-            for key, value in intent["rollback"].items()
-            if key not in {"service", "namespace", "name"}
-        }
+        raw_before = runner_result.get("before")
+        before = dict(raw_before) if isinstance(raw_before, dict) else {}
+        if result.ok and runner_result.get("resource_version"):
+            before["expected_resource_version"] = str(
+                runner_result["resource_version"]
+            )
         after = runner_result.get("after") or {
             key: value
             for key, value in intent["arguments"].items()
             if key not in {"service", "namespace", "name"}
         }
-        self.store.record_execution(
+        await self._db(
+            self.store.record_execution,
             intent_id,
             result.data,
             before,
             after,
             result.duration_ms,
+            succeeded=result.ok,
         )
-        self._checkpoint(
+        await self._checkpoint(
             run_id,
             incident["id"],
             "EXECUTION_RECORDED",
@@ -410,7 +566,8 @@ class IncidentEngine:
                 "source_uri": result.source_uri,
             },
         )
-        self.store.add_trace(
+        await self._db(
+            self.store.add_trace,
             run_id,
             incident["id"],
             "tool_execution",
@@ -421,8 +578,33 @@ class IncidentEngine:
             {"mode": self.settings.execution_mode, "idempotency_key": intent["idempotency_key"]},
         )
         if not result.ok:
-            return await self.rollback(intent_id, "Execution Job failed.")
-        return await self._verify_and_finalize(self.store.get_intent(intent_id), incident)
+            await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 5)
+            await self._checkpoint(
+                run_id,
+                incident["id"],
+                "EXECUTION_FAILED_UNCERTAIN",
+                {
+                    "tool_intent_id": intent_id,
+                    "reason": "Execution failed; automatic compensation was not attempted.",
+                },
+            )
+            updated = await self._db(
+                self.store.update_status,
+                incident["id"],
+                IncidentStatus.HUMAN_HANDOFF,
+                "tool-gateway",
+                {
+                    "reason": (
+                        "Execution failed with unknown mutation state; automatic compensation "
+                        "was suppressed."
+                    )
+                },
+            )
+            report = await self._reporter_output(incident["id"], run_id)
+            await self._db(self.postmortems.generate, incident["id"], report)
+            return updated
+        latest_intent = await self._db(self.store.get_intent, intent_id)
+        return await self._verify_and_finalize(latest_intent, incident)
 
     async def _verify_and_finalize(
         self,
@@ -430,19 +612,21 @@ class IncidentEngine:
         incident: dict[str, Any],
     ) -> dict[str, Any]:
         run_id = intent["run_id"]
-        self.store.update_status(
+        await self._db(
+            self.store.update_status,
             incident["id"],
             IncidentStatus.VERIFYING,
             "orchestrator",
         )
-        self._checkpoint(
+        await self._checkpoint(
             run_id,
             incident["id"],
             "VERIFYING",
             {"tool_intent_id": intent["id"]},
         )
         verification = await self._verify(incident, run_id)
-        self.store.add_trace(
+        await self._db(
+            self.store.add_trace,
             run_id,
             incident["id"],
             "verification",
@@ -453,29 +637,52 @@ class IncidentEngine:
             verification,
         )
         if not verification["passed"]:
+            latest_intent = await self._db(self.store.get_intent, intent["id"])
+            if not self._has_effective_rollback(latest_intent["rollback"]):
+                await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 6)
+                await self._checkpoint(
+                    run_id,
+                    incident["id"],
+                    "VERIFICATION_FAILED_WITHOUT_COMPENSATION",
+                    {"tool_intent_id": intent["id"], "verification": verification},
+                )
+                updated = await self._db(
+                    self.store.update_status,
+                    incident["id"],
+                    IncidentStatus.HUMAN_HANDOFF,
+                    "verification-controller",
+                    {
+                        "reason": (
+                            "Verification failed and no state-restoring compensation exists."
+                        )
+                    },
+                )
+                report = await self._reporter_output(incident["id"], run_id)
+                await self._db(self.postmortems.generate, incident["id"], report)
+                return updated
             return await self.rollback(
                 intent["id"],
                 "Post-change SLO verification failed.",
             )
-        self.store.finish_run(run_id, "RESOLVED", 3298, 6)
-        resolved = self.store.update_status(
+        await self._db(self.store.finish_run, run_id, "RESOLVED", 3298, 6)
+        resolved = await self._db(
+            self.store.update_status,
             incident["id"],
             IncidentStatus.RESOLVED,
             "commander-agent",
             {"verification": "passed", "postmortem": "generated"},
+            stream_event=(
+                "incident.resolved",
+                {"run_id": run_id, "tool_intent_id": intent["id"]},
+            ),
         )
         report = await self._reporter_output(incident["id"], run_id)
-        self.postmortems.generate(incident["id"], report)
-        self._checkpoint(
+        await self._db(self.postmortems.generate, incident["id"], report)
+        await self._checkpoint(
             run_id,
             incident["id"],
             "RESOLVED",
             {"tool_intent_id": intent["id"], "verification": verification},
-        )
-        await self.event_stream.publish(
-            "incident.resolved",
-            incident["id"],
-            {"run_id": run_id, "tool_intent_id": intent["id"]},
         )
         return resolved
 
@@ -486,7 +693,7 @@ class IncidentEngine:
         reviewer: str,
         comment: str,
     ) -> dict[str, Any]:
-        intent = self.store.get_intent(intent_id)
+        intent = await self._db(self.store.get_intent, intent_id)
         allowed_arguments = {
             "kubernetes.patch_deployment": {
                 "service",
@@ -516,23 +723,9 @@ class IncidentEngine:
         for field in ("service", "namespace", "name"):
             if normalized.get(field) != intent["arguments"].get(field):
                 raise ValueError(f"Protected target field {field!r} cannot be edited.")
-        for field in ("memory_limit", "cpu_limit", "container"):
-            value = normalized.get(field)
-            if value is not None and (
-                not isinstance(value, str)
-                or len(value) > 80
-                or not re.fullmatch(r"[A-Za-z0-9_.+-]+", value)
-            ):
-                raise ValueError(f"Argument {field!r} has an invalid value.")
-        if "replicas" in normalized:
-            replicas = normalized["replicas"]
-            if (
-                not isinstance(replicas, int)
-                or isinstance(replicas, bool)
-                or not 0 <= replicas <= 100
-            ):
-                raise ValueError("replicas must be an integer between 0 and 100.")
-        updated = self.store.edit_intent(
+        self._validate_mutation_arguments(normalized, rollback=False)
+        updated = await self._db(
+            self.store.edit_intent,
             intent_id,
             normalized,
             reviewer,
@@ -543,14 +736,18 @@ class IncidentEngine:
             updated["environment"],
             normalized,
         )
-        self.store.update_intent_risk(intent_id, str(risk))
-        incident = self.store.get_incident(updated["incident_id"])
+        await self._db(self.store.update_intent_risk, intent_id, str(risk))
+        incident = await self._db(
+            self.store.get_incident, updated["incident_id"]
+        )
         policy_input = PolicySimulationRequest(
             environment=updated["environment"],
             tool=updated["tool_name"],
-            resource=str(updated["resource"].get("name", "unknown")),
+            resource=updated["resource"],
+            arguments=normalized,
+            rollback=updated["rollback"],
             risk_level=risk,
-            has_rollback=bool(updated["rollback"]),
+            has_rollback=self._has_effective_rollback(updated["rollback"]),
             edited=True,
             incident_severity=incident["severity"],
         ).model_dump(mode="json")
@@ -563,13 +760,14 @@ class IncidentEngine:
                 "reason": "Every edited intent requires a fresh human approval.",
                 "backend": decision.get("backend", self.settings.policy_backend),
             }
-        self.store.record_policy(
+        await self._db(
+            self.store.record_policy,
             intent_id,
             self.settings.policy_version,
             decision,
             policy_input,
         )
-        self._checkpoint(
+        await self._checkpoint(
             updated["run_id"],
             updated["incident_id"],
             "INTENT_EDITED_AND_REEVALUATED",
@@ -581,14 +779,16 @@ class IncidentEngine:
             },
         )
         if decision["decision"] == "deny":
-            self.store.update_status(
+            await self._db(
+                self.store.update_status,
                 updated["incident_id"],
                 IncidentStatus.DENIED,
                 "policy-gateway",
                 {"matched_policy": decision["matched_policy"]},
             )
         else:
-            self.store.update_status(
+            await self._db(
+                self.store.update_status,
                 updated["incident_id"],
                 IncidentStatus.WAITING_APPROVAL,
                 "policy-gateway",
@@ -597,19 +797,40 @@ class IncidentEngine:
                     "matched_policy": decision["matched_policy"],
                 },
             )
-        return self.store.get_intent(intent_id)
+        return await self._db(self.store.get_intent, intent_id)
 
     async def rollback(self, intent_id: str, reason: str) -> dict[str, Any]:
-        intent = self.store.get_intent(intent_id)
-        incident = self.store.get_incident(intent["incident_id"])
+        intent = await self._db(self.store.get_intent, intent_id)
+        incident = await self._db(self.store.get_incident, intent["incident_id"])
+        if intent["status"] == "ROLLED_BACK":
+            return await self._db(
+                self.store.update_status,
+                incident["id"],
+                IncidentStatus.ROLLED_BACK,
+                "compensation-controller",
+                {"rollback": "succeeded", "reason": "Recovered completed compensation."},
+            )
+        if intent["status"] == "ROLLBACK_FAILED":
+            return await self._db(
+                self.store.update_status,
+                incident["id"],
+                IncidentStatus.HUMAN_HANDOFF,
+                "compensation-controller",
+                {"rollback": "failed", "reason": "Recovered failed compensation."},
+            )
+        if intent["status"] != "EXECUTED":
+            raise ValueError(f"Tool intent cannot be compensated: {intent['status']}")
+        if not self._has_effective_rollback(intent["rollback"]):
+            raise ValueError("Tool intent has no state-restoring compensation.")
         run_id = intent["run_id"]
-        self._checkpoint(
+        await self._checkpoint(
             run_id,
             incident["id"],
             "ROLLBACK_STARTED",
             {"tool_intent_id": intent_id, "reason": reason},
         )
-        self.store.update_status(
+        await self._db(
+            self.store.update_status,
             incident["id"],
             IncidentStatus.ROLLING_BACK,
             "tool-gateway",
@@ -630,7 +851,8 @@ class IncidentEngine:
                 intent["rollback"],
                 context,
             )
-        self.store.record_rollback(
+        await self._db(
+            self.store.record_rollback,
             intent_id,
             {
                 "ok": result.ok,
@@ -639,7 +861,8 @@ class IncidentEngine:
                 "result": result.data,
             },
         )
-        self.store.add_trace(
+        await self._db(
+            self.store.add_trace,
             run_id,
             incident["id"],
             "compensation",
@@ -650,47 +873,50 @@ class IncidentEngine:
             {"reason": reason, "source_uri": result.source_uri},
         )
         status = IncidentStatus.ROLLED_BACK if result.ok else IncidentStatus.HUMAN_HANDOFF
-        self.store.finish_run(
+        await self._db(
+            self.store.finish_run,
             run_id,
             "ROLLED_BACK" if result.ok else "HUMAN_HANDOFF",
             3298,
             7,
         )
-        updated = self.store.update_status(
+        updated = await self._db(
+            self.store.update_status,
             incident["id"],
             status,
             "compensation-controller",
             {"rollback": "succeeded" if result.ok else "failed", "reason": reason},
+            stream_event=(
+                "incident.rollback_completed",
+                {"run_id": run_id, "ok": result.ok, "reason": reason},
+            ),
         )
         report = await self._reporter_output(incident["id"], run_id)
-        self.postmortems.generate(incident["id"], report)
-        self._checkpoint(
+        await self._db(self.postmortems.generate, incident["id"], report)
+        await self._checkpoint(
             run_id,
             incident["id"],
             "ROLLED_BACK" if result.ok else "ROLLBACK_FAILED",
             {"tool_intent_id": intent_id, "ok": result.ok, "reason": reason},
         )
-        await self.event_stream.publish(
-            "incident.rollback_completed",
-            incident["id"],
-            {"run_id": run_id, "ok": result.ok, "reason": reason},
-        )
         return updated
 
     async def resume(self, incident_id: str) -> dict[str, Any]:
-        lock_name = f"incident:{incident_id}"
-        token = await self.event_stream.acquire_lock(lock_name)
-        if token is None:
-            raise WorkflowLocked("Incident recovery is already active on another worker.")
         try:
-            return await self._resume_unlocked(incident_id)
-        finally:
-            await self.event_stream.release_lock(lock_name, token)
+            return await self.event_stream.run_with_lock(
+                f"incident:{incident_id}",
+                1800,
+                lambda: self._resume_unlocked(incident_id),
+            )
+        except (LockUnavailable, LockLeaseLost) as exc:
+            raise WorkflowLocked(
+                "Incident recovery lock is unavailable or its lease was lost."
+            ) from exc
 
     async def _resume_unlocked(self, incident_id: str) -> dict[str, Any]:
         lock = self._locks.setdefault(incident_id, asyncio.Lock())
         async with lock:
-            incident = self.store.get_incident(incident_id)
+            incident = await self._db(self.store.get_incident, incident_id)
             run_id = incident.get("current_run_id")
             if not run_id:
                 should_start = True
@@ -703,6 +929,8 @@ class IncidentEngine:
                 intents = incident.get("tool_intents", [])
                 intent = intents[0] if intents else None
                 if status == "WAITING_APPROVAL":
+                    if intent and intent["status"] == "APPROVED":
+                        return await self.execute(intent["id"])
                     return incident
                 if status in {"EXECUTING", "VERIFYING"} and intent:
                     return await self.execute(intent["id"])
@@ -710,14 +938,15 @@ class IncidentEngine:
                     return await self.rollback(intent["id"], "Resumed interrupted rollback.")
                 if status in {"RESOLVED", "DENIED", "ROLLED_BACK", "CANCELLED"}:
                     return incident
-                self.store.finish_run(run_id, "SUPERSEDED", 0, 0)
-                self._checkpoint(
+                await self._db(self.store.finish_run, run_id, "SUPERSEDED", 0, 0)
+                await self._checkpoint(
                     run_id,
                     incident_id,
                     "SUPERSEDED_FOR_SAFE_REPLAN",
                     {"previous_status": status},
                 )
-                self.store.update_status(
+                await self._db(
+                    self.store.update_status,
                     incident_id,
                     IncidentStatus.NEW,
                     "recovery-controller",
@@ -726,11 +955,11 @@ class IncidentEngine:
         return await self._start_unlocked(incident_id)
 
     async def replay(self, incident_id: str) -> dict[str, Any]:
-        incident = self.store.get_incident(incident_id)
+        incident = await self._db(self.store.get_incident, incident_id)
         run_id = incident.get("current_run_id")
         if not run_id:
             raise ValueError("No run is available to replay.")
-        original = self.store.get_run(run_id)
+        original = await self._db(self.store.get_run, run_id)
         return {
             "incident_id": incident_id,
             "source_run_id": run_id,
@@ -752,13 +981,9 @@ class IncidentEngine:
         duration_ms: int,
         attributes: dict[str, Any] | None = None,
     ) -> None:
-        self.store.update_status(incident_id, status, actor)
-        await self.event_stream.publish(
-            "incident.status_changed",
-            incident_id,
-            {"status": str(status), "actor": actor, **(attributes or {})},
-        )
-        self.store.add_trace(
+        await self._db(self.store.update_status, incident_id, status, actor)
+        await self._db(
+            self.store.add_trace,
             run_id,
             incident_id,
             span_type,
@@ -768,30 +993,38 @@ class IncidentEngine:
             duration_ms,
             attributes,
         )
-        self._checkpoint(
+        await self._checkpoint(
             run_id,
             incident_id,
             str(status),
             {"actor": actor, **(attributes or {})},
         )
 
-    def _checkpoint(
+    async def _checkpoint(
         self,
         run_id: str,
         incident_id: str,
         phase: str,
         state: dict[str, Any] | None = None,
     ) -> None:
-        self.store.checkpoint_workflow(run_id, incident_id, phase, state)
+        await self._db(
+            self.store.checkpoint_workflow,
+            run_id,
+            incident_id,
+            phase,
+            state,
+        )
 
     async def _collect_evidence(
         self,
         incident: dict[str, Any],
         run_id: str,
+        target: dict[str, str],
     ) -> list[str]:
         calls = [
             ("prometheus.query", "Latency increase", "prometheus"),
             ("kubernetes.get_events", "Workload events", "kubernetes"),
+            ("kubernetes.get_deployment", "Deployment state", "kubernetes"),
             ("loki.query", "Correlated error logs", "loki"),
             ("github.get_deployments", "Recent deployment", "github"),
         ]
@@ -808,7 +1041,7 @@ class IncidentEngine:
                 {
                     "service": incident["service"],
                     "environment": incident["environment"],
-                    "namespace": self._target_namespace(incident["environment"]),
+                    "namespace": target["namespace"],
                 },
                 context,
             )
@@ -818,10 +1051,15 @@ class IncidentEngine:
                     "source_uri": result.source_uri,
                     "title": title,
                     "content": self._summarize_result(tool_name, result.data),
-                    "metadata": {"raw": result.data, "duration_ms": result.duration_ms},
+                    "metadata": {
+                        "raw": result.data,
+                        "duration_ms": result.duration_ms,
+                        "ok": result.ok,
+                    },
                 }
             )
-            self.store.add_trace(
+            await self._db(
+                self.store.add_trace,
                 run_id,
                 incident["id"],
                 "retrieval" if source_type in {"prometheus", "loki"} else "tool",
@@ -831,7 +1069,9 @@ class IncidentEngine:
                 result.duration_ms,
                 {"source_uri": result.source_uri},
             )
-        evidence_ids = self.store.add_evidence(incident["id"], collected)
+        evidence_ids = await self._db(
+            self.store.add_evidence, incident["id"], collected
+        )
         await self.evidence_index.index(
             evidence_ids,
             [item["content"] for item in collected],
@@ -854,6 +1094,11 @@ class IncidentEngine:
                 f"{data['pods_affected']} pods report {data['restart_count']} OOMKilled "
                 f"restarts with a {data['memory_limit']} memory limit."
             )
+        if tool_name == "kubernetes.get_deployment":
+            return (
+                f"Deployment {data.get('namespace', 'unknown')}/{data.get('name', 'unknown')} "
+                f"has {data.get('ready_replicas', 0)}/{data.get('replicas', 0)} ready replicas."
+            )
         if tool_name == "loki.query":
             return f"{data.get('matches', 0)} correlated error log lines were found."
         if "deployments" in data:
@@ -871,16 +1116,27 @@ class IncidentEngine:
         if self.settings.verification_url_template:
             url = self.settings.verification_url_template.format(
                 service=incident["service"],
-                namespace=self._target_namespace(incident["environment"]),
+                namespace=self._target_binding(incident)["namespace"],
             )
             started = asyncio.get_running_loop().time()
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get(url)
-                    body = response.json() if response.headers.get("content-type", "").startswith(
-                        "application/json"
-                    ) else {}
-                passed = response.is_success and body.get("status", "ok") == "ok"
+                    content_type = response.headers.get("content-type", "").lower()
+                    if not content_type.startswith("application/json"):
+                        raise ValueError(
+                            "Verification endpoint did not return application/json."
+                        )
+                    body = response.json()
+                    if not isinstance(body, dict):
+                        raise ValueError(
+                            "Verification endpoint returned a non-object JSON payload."
+                        )
+                passed = (
+                    response.is_success
+                    and str(body.get("status", "")).strip().lower()
+                    in {"ok", "healthy"}
+                )
             except (httpx.HTTPError, ValueError) as exc:
                 passed = False
                 body = {"error": str(exc)}
@@ -893,7 +1149,7 @@ class IncidentEngine:
                 "response": body,
                 "mode": "service-health",
             }
-        if self.settings.connector_mode != "production":
+        if self.settings.connector_mode in {"mock", "hybrid"}:
             return {
                 "passed": True,
                 "duration_ms": 1203,
@@ -902,29 +1158,111 @@ class IncidentEngine:
                 "restart_count_after": 0,
                 "mode": "simulation",
             }
-        context = ToolContext(
-            incident_id=incident["id"],
-            run_id=run_id,
-            actor="verification-controller",
-            idempotency_key=f"{incident['id'].lower()}-verify",
+        target = self._target_binding(incident)
+
+        async def verify_tool(
+            tool_name: str,
+            arguments: dict[str, Any],
+            suffix: str,
+        ):
+            return await self.transport.call_tool(
+                tool_name,
+                arguments,
+                ToolContext(
+                    incident_id=incident["id"],
+                    run_id=run_id,
+                    actor="verification-controller",
+                    idempotency_key=f"{incident['id'].lower()}-verify-{suffix}",
+                ),
+            )
+
+        base_arguments = {
+            "service": incident["service"],
+            "environment": incident["environment"],
+            "namespace": target["namespace"],
+            "name": target["name"],
+        }
+        latency_result, error_result, workload_result = await asyncio.gather(
+            verify_tool("prometheus.query", base_arguments, "latency"),
+            verify_tool(
+                "prometheus.query",
+                {
+                    **base_arguments,
+                    "query": (
+                        "sum(rate(http_server_requests_total"
+                        f'{{service="{incident["service"]}",status=~"5.."}}[5m])) / '
+                        "clamp_min(sum(rate(http_server_requests_total"
+                        f'{{service="{incident["service"]}"}}[5m])), 0.001)'
+                    ),
+                },
+                "errors",
+            ),
+            verify_tool("kubernetes.get_deployment", base_arguments, "workload"),
         )
-        result = await self.transport.call_tool(
-            "prometheus.query",
-            {
-                "service": incident["service"],
-                "environment": incident["environment"],
-                "namespace": self._target_namespace(incident["environment"]),
-            },
-            context,
+
+        latency_data = (
+            latency_result.data if isinstance(latency_result.data, dict) else {}
         )
-        p95 = float(result.data.get("value", float("inf"))) if result.ok else float("inf")
+        error_data = error_result.data if isinstance(error_result.data, dict) else {}
+        workload_data = (
+            workload_result.data if isinstance(workload_result.data, dict) else {}
+        )
+        try:
+            p95 = float(latency_data["value"]) if latency_result.ok else float("inf")
+        except (KeyError, TypeError, ValueError):
+            p95 = float("inf")
+        try:
+            error_rate = float(error_data["value"]) if error_result.ok else float("inf")
+        except (KeyError, TypeError, ValueError):
+            error_rate = float("inf")
+        latency_series = latency_data.get("series")
+        error_series = error_data.get("series")
+        metrics_valid = (
+            latency_result.ok
+            and error_result.ok
+            and math.isfinite(p95)
+            and math.isfinite(error_rate)
+            and isinstance(latency_series, int)
+            and not isinstance(latency_series, bool)
+            and latency_series > 0
+            and isinstance(error_series, int)
+            and not isinstance(error_series, bool)
+            and error_series > 0
+        )
+        desired = workload_data.get("replicas")
+        ready = workload_data.get("ready_replicas")
+        workload_stable = (
+            workload_result.ok
+            and isinstance(desired, int)
+            and not isinstance(desired, bool)
+            and desired > 0
+            and isinstance(ready, int)
+            and not isinstance(ready, bool)
+            and ready >= desired
+        )
         return {
-            "passed": result.ok and p95 <= 1.0,
-            "duration_ms": result.duration_ms,
+            "passed": metrics_valid and workload_stable and p95 <= 1.0 and error_rate <= 0.05,
+            "duration_ms": max(
+                latency_result.duration_ms,
+                error_result.duration_ms,
+                workload_result.duration_ms,
+            ),
             "p95_after_seconds": p95,
+            "error_rate_after": error_rate,
+            "latency_series": latency_series,
+            "error_series": error_series,
+            "metrics_valid": metrics_valid,
+            "workload_stable": workload_stable,
+            "ready_replicas": ready,
+            "desired_replicas": desired,
             "threshold_seconds": 1.0,
-            "source_uri": result.source_uri,
-            "mode": "production",
+            "error_rate_threshold": 0.05,
+            "source_uris": [
+                latency_result.source_uri,
+                error_result.source_uri,
+                workload_result.source_uri,
+            ],
+            "mode": self.settings.connector_mode,
         }
 
     async def _reporter_output(
@@ -935,11 +1273,11 @@ class IncidentEngine:
         if not self.orchestrator:
             return None
         try:
-            return await self.orchestrator.generate_report(
-                self.store.get_incident(incident_id)
-            )
+            incident = await self._db(self.store.get_incident, incident_id)
+            return await self.orchestrator.generate_report(incident)
         except Exception as exc:
-            self.store.add_trace(
+            await self._db(
+                self.store.add_trace,
                 run_id,
                 incident_id,
                 "llm",
@@ -958,17 +1296,242 @@ class IncidentEngine:
             "causing repeated OOM kills and elevated tail latency."
         )
 
+    def _target_binding(self, incident: dict[str, Any]) -> dict[str, str]:
+        service = str(incident["service"]).strip()
+        environment = str(incident["environment"]).strip().lower()
+        target = self.target_inventory.get(service)
+        if target:
+            if environment != target["environment"]:
+                raise ValueError(
+                    f"Incident environment {environment!r} does not match the authoritative "
+                    f"target inventory environment {target['environment']!r}."
+                )
+            return {"service": service, **target}
+        if self.settings.enforce_production_guards:
+            raise ValueError(f"Service {service!r} is absent from the target inventory.")
+        return {
+            "service": service,
+            "environment": environment,
+            "namespace": self.settings.kubernetes_namespace,
+            "name": service,
+        }
+
+    async def _capture_prechange_state(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        target: dict[str, str],
+        incident: dict[str, Any],
+        run_id: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        context = ToolContext(
+            incident_id=incident["id"],
+            run_id=run_id,
+            actor="preflight-controller",
+            idempotency_key=f"{incident['id'].lower()}-{run_id.lower()}-preflight",
+        )
+        result = await self.transport.call_tool(
+            "kubernetes.get_deployment",
+            dict(target),
+            context,
+        )
+        if not result.ok or not isinstance(result.data, dict):
+            raise ValueError(
+                "Authoritative pre-change Deployment snapshot is unavailable."
+            )
+        snapshot = result.data
+        if (
+            snapshot.get("name") != target["name"]
+            or snapshot.get("namespace") != target["namespace"]
+        ):
+            raise ValueError(
+                "Pre-change Deployment snapshot does not match the bound target."
+            )
+        resource_version = str(snapshot.get("resource_version") or "").strip()
+        if not resource_version:
+            raise ValueError(
+                "Pre-change Deployment snapshot has no resourceVersion."
+            )
+
+        bound_arguments = dict(arguments)
+        bound_arguments["expected_resource_version"] = resource_version
+        rollback: dict[str, Any] = dict(target)
+        if tool_name == "kubernetes.patch_deployment":
+            containers = snapshot.get("containers")
+            if not isinstance(containers, list) or not containers:
+                raise ValueError(
+                    "Pre-change Deployment snapshot has no container state."
+                )
+            requested_container = bound_arguments.get("container")
+            container = next(
+                (
+                    item
+                    for item in containers
+                    if isinstance(item, dict)
+                    and (
+                        requested_container is None
+                        or item.get("name") == requested_container
+                    )
+                ),
+                None,
+            )
+            if not container or not isinstance(container.get("name"), str):
+                raise ValueError(
+                    "Requested container is absent from the pre-change snapshot."
+                )
+            limits = container.get("limits")
+            if not isinstance(limits, dict):
+                limits = {}
+            bound_arguments["container"] = container["name"]
+            rollback.update(
+                {
+                    "container": container["name"],
+                    "memory_limit": limits.get("memory"),
+                    "cpu_limit": limits.get("cpu"),
+                }
+            )
+        elif tool_name == "kubernetes.scale_deployment":
+            replicas = snapshot.get("replicas")
+            if (
+                not isinstance(replicas, int)
+                or isinstance(replicas, bool)
+                or replicas < 0
+            ):
+                raise ValueError(
+                    "Pre-change Deployment snapshot has no valid replica count."
+                )
+            rollback["replicas"] = replicas
+        elif tool_name != "kubernetes.rollout_restart":
+            raise ValueError(f"Tool {tool_name!r} is outside the execution allowlist.")
+        return bound_arguments, rollback
+
+    @staticmethod
+    def _resource_lock_key(intent: dict[str, Any]) -> str:
+        resource = intent.get("resource")
+        if not isinstance(resource, dict):
+            raise ValueError("Tool intent has no bound resource identity.")
+        namespace = str(resource.get("namespace") or "").strip().lower()
+        kind = str(resource.get("kind") or "").strip().lower()
+        name = str(resource.get("name") or "").strip().lower()
+        if not namespace or not kind or not name:
+            raise ValueError("Tool intent has an incomplete bound resource identity.")
+        return f"resource:{namespace}:{kind}:{name}"
+
     def _target_namespace(self, environment: str) -> str:
-        if environment in self.settings.kubernetes_allowed_namespaces:
-            return environment
-        if environment.lower() in {
-            "production",
-            "prod",
-            "staging",
-            "stage",
-            "development",
-            "dev",
-            "test",
-        }:
-            return self.settings.kubernetes_namespace
+        # Compatibility helper for callers that only need the local demo namespace.
         return self.settings.kubernetes_namespace
+
+    @staticmethod
+    def _has_effective_rollback(rollback: dict[str, Any]) -> bool:
+        return any(
+            has_effective_rollback(tool, rollback)
+            for tool in (
+                "kubernetes.patch_deployment",
+                "kubernetes.scale_deployment",
+            )
+        )
+
+    @staticmethod
+    def _normalize_tool_arguments(
+        tool_name: str,
+        proposed: dict[str, Any],
+        target: dict[str, str],
+        *,
+        rollback: bool = False,
+    ) -> dict[str, Any]:
+        mutable_fields = {
+            "kubernetes.patch_deployment": {"container", "memory_limit", "cpu_limit"},
+            "kubernetes.scale_deployment": {"replicas"},
+            "kubernetes.rollout_restart": set(),
+        }.get(tool_name)
+        if mutable_fields is None:
+            raise ValueError(f"Tool {tool_name!r} is outside the execution allowlist.")
+        if not isinstance(proposed, dict):
+            raise ValueError("Tool arguments must be an object.")
+        protected = {"service", "environment", "namespace", "name"}
+        for field in protected & proposed.keys():
+            if str(proposed[field]) != target[field]:
+                raise ValueError(f"Agent attempted to retarget protected field {field!r}.")
+        unexpected = set(proposed) - protected - mutable_fields
+        if unexpected:
+            raise ValueError(
+                "Agent emitted unsupported arguments: " + ", ".join(sorted(unexpected))
+            )
+        if not rollback:
+            required_change = {
+                "kubernetes.patch_deployment": {"memory_limit", "cpu_limit"},
+                "kubernetes.scale_deployment": {"replicas"},
+                "kubernetes.rollout_restart": set(),
+            }[tool_name]
+            if required_change and not (set(proposed) & required_change):
+                raise ValueError(f"Tool {tool_name!r} has no requested state change.")
+        normalized: dict[str, Any] = dict(target)
+        normalized.update({key: proposed[key] for key in mutable_fields if key in proposed})
+        IncidentEngine._validate_mutation_arguments(
+            normalized,
+            rollback=rollback,
+        )
+        if rollback and tool_name == "kubernetes.rollout_restart":
+            return dict(target)
+        return normalized
+
+    @staticmethod
+    def _validate_mutation_arguments(
+        arguments: dict[str, Any],
+        *,
+        rollback: bool,
+    ) -> None:
+        container = arguments.get("container")
+        if container is not None and (
+            not isinstance(container, str)
+            or len(container) > 63
+            or not re.fullmatch(r"[a-z0-9](?:[-a-z0-9.]*[a-z0-9])?", container)
+        ):
+            raise ValueError("Argument 'container' is not a valid Kubernetes name.")
+
+        memory = arguments.get("memory_limit")
+        if "memory_limit" in arguments:
+            if memory is None and rollback:
+                pass
+            elif not isinstance(memory, str):
+                raise ValueError("memory_limit must be a bounded Kubernetes quantity.")
+            else:
+                match = re.fullmatch(r"([1-9][0-9]*)(Ki|Mi|Gi)", memory)
+                if not match:
+                    raise ValueError(
+                        "memory_limit must use a positive Ki, Mi, or Gi quantity."
+                    )
+                amount = int(match.group(1))
+                multiplier = {"Ki": 1 / 1024, "Mi": 1, "Gi": 1024}[match.group(2)]
+                memory_mib = amount * multiplier
+                if not 16 <= memory_mib <= 64 * 1024:
+                    raise ValueError("memory_limit must be between 16Mi and 64Gi.")
+
+        cpu = arguments.get("cpu_limit")
+        if "cpu_limit" in arguments:
+            if cpu is None and rollback:
+                pass
+            elif not isinstance(cpu, str):
+                raise ValueError("cpu_limit must be a bounded Kubernetes quantity.")
+            else:
+                milli_match = re.fullmatch(r"([1-9][0-9]*)m", cpu)
+                core_match = re.fullmatch(r"([1-9][0-9]*)", cpu)
+                if milli_match:
+                    cpu_millicores = int(milli_match.group(1))
+                elif core_match:
+                    cpu_millicores = int(core_match.group(1)) * 1000
+                else:
+                    raise ValueError(
+                        "cpu_limit must use positive whole cores or millicores."
+                    )
+                if not 10 <= cpu_millicores <= 64_000:
+                    raise ValueError("cpu_limit must be between 10m and 64 cores.")
+
+        if "replicas" in arguments:
+            replicas = arguments["replicas"]
+            if (
+                not isinstance(replicas, int)
+                or isinstance(replicas, bool)
+                or not 1 <= replicas <= 20
+            ):
+                raise ValueError("replicas must be an integer between 1 and 20.")

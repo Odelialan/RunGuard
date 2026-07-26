@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
 
+from .policy import READ_TOOLS, WRITE_TOOLS
+
 if TYPE_CHECKING:
     from .config import Settings
 
@@ -50,7 +52,10 @@ class MockMCPTransport:
             {"name": "prometheus.query", "write": False},
             {"name": "loki.query", "write": False},
             {"name": "kubernetes.get_events", "write": False},
+            {"name": "kubernetes.get_deployment", "write": False},
             {"name": "kubernetes.patch_deployment", "write": True},
+            {"name": "kubernetes.scale_deployment", "write": True},
+            {"name": "kubernetes.rollout_restart", "write": True},
             {"name": "github.get_deployments", "write": False},
         ]
 
@@ -97,6 +102,29 @@ class MockMCPTransport:
                 f"k8s://{arguments.get('environment', 'staging')}/deployment/{service}",
                 438,
             ),
+            "kubernetes.get_deployment": ToolResult(
+                True,
+                {
+                    "name": arguments.get("name", service),
+                    "namespace": arguments.get("namespace", "runguard-system"),
+                    "replicas": 3,
+                    "ready_replicas": 3,
+                    "generation": 7,
+                    "resource_version": "sim-1041",
+                    "containers": [
+                        {
+                            "name": "api",
+                            "image": "example.invalid/order-api:demo",
+                            "limits": {"memory": "256Mi", "cpu": "500m"},
+                        }
+                    ],
+                },
+                (
+                    f"k8s://{arguments.get('namespace', 'runguard-system')}"
+                    f"/deployment/{arguments.get('name', service)}"
+                ),
+                220,
+            ),
             "github.get_deployments": ToolResult(
                 True,
                 {
@@ -118,9 +146,52 @@ class MockMCPTransport:
                     "resource_version": "sim-1042",
                     "applied": arguments,
                     "idempotency_key": context.idempotency_key,
+                    "runner_result": {
+                        "ok": True,
+                        "before": {
+                            "container": arguments.get("container", "api"),
+                            "memory_limit": "256Mi",
+                            "cpu_limit": "500m",
+                        },
+                        "after": {
+                            "memory_limit": arguments.get("memory_limit", "256Mi"),
+                            "cpu_limit": arguments.get("cpu_limit", "500m"),
+                        },
+                        "resource_version": "sim-1042",
+                    },
                 },
                 f"k8s://simulation/deployment/{service}",
                 684,
+            )
+        if tool_name == "kubernetes.scale_deployment":
+            return ToolResult(
+                True,
+                {
+                    "mode": "simulation",
+                    "runner_result": {
+                        "ok": True,
+                        "before": {"replicas": 3},
+                        "after": {"replicas": arguments["replicas"]},
+                        "resource_version": "sim-1042",
+                    },
+                },
+                f"k8s://simulation/deployment/{service}/scale",
+                500,
+            )
+        if tool_name == "kubernetes.rollout_restart":
+            return ToolResult(
+                True,
+                {
+                    "mode": "simulation",
+                    "runner_result": {
+                        "ok": True,
+                        "before": {},
+                        "after": {"restarted": True},
+                        "resource_version": "sim-1042",
+                    },
+                },
+                f"k8s://simulation/deployment/{service}/restart",
+                500,
             )
         return ToolResult(
             False,
@@ -166,6 +237,16 @@ class ProductionMCPTransport:
             {"name": "github.get_deployments", "write": False, "backend": "github-rest"},
             {
                 "name": "kubernetes.patch_deployment",
+                "write": True,
+                "backend": "restricted-kubernetes-job",
+            },
+            {
+                "name": "kubernetes.scale_deployment",
+                "write": True,
+                "backend": "restricted-kubernetes-job",
+            },
+            {
+                "name": "kubernetes.rollout_restart",
                 "write": True,
                 "backend": "restricted-kubernetes-job",
             },
@@ -231,6 +312,18 @@ class ProductionMCPTransport:
         arguments: dict[str, Any],
         context: ToolContext,
     ) -> ToolResult:
+        if self.settings.execution_mode != "kubernetes_job":
+            return ToolResult(
+                ok=True,
+                data={
+                    "mode": "simulation",
+                    "rollback": True,
+                    "applied": arguments,
+                    "idempotency_key": context.idempotency_key,
+                },
+                source_uri="k8s://simulation/restricted-job/rollback",
+                duration_ms=0,
+            )
         from .kubernetes_executor import KubernetesJobSpec
 
         return await self.executor.execute(
@@ -258,10 +351,12 @@ class ProductionMCPTransport:
             raise RuntimeError(f"Prometheus query failed: {body}")
         rows = body.get("data", {}).get("result", [])
         values = [float(row["value"][1]) for row in rows if row.get("value")]
+        if not rows or not values:
+            raise RuntimeError("Prometheus query returned no time series samples.")
         return (
             {
                 "query": query,
-                "value": max(values) if values else 0.0,
+                "value": max(values),
                 "unit": "seconds",
                 "series": len(rows),
                 "raw": rows[:20],
@@ -323,8 +418,9 @@ class ProductionMCPTransport:
         self._configure_kubernetes()
         namespace = arguments.get("namespace") or arguments.get("environment") or "default"
         service = arguments["service"]
+        name = arguments.get("name") or service
         if tool_name == "kubernetes.get_deployment":
-            deployment = client.AppsV1Api().read_namespaced_deployment(service, namespace)
+            deployment = client.AppsV1Api().read_namespaced_deployment(name, namespace)
             containers = deployment.spec.template.spec.containers
             return (
                 {
@@ -343,7 +439,7 @@ class ProductionMCPTransport:
                         for container in containers
                     ],
                 },
-                f"k8s://{namespace}/deployment/{service}",
+                f"k8s://{namespace}/deployment/{name}",
             )
         events = client.CoreV1Api().list_namespaced_event(
             namespace,
@@ -441,11 +537,8 @@ class StreamableHTTPMCPTransport:
         "kubernetes.": "kubernetes",
         "github.": "github",
     }
-    WRITE_TOOLS = {
-        "kubernetes.patch_deployment",
-        "kubernetes.scale_deployment",
-        "kubernetes.rollout_restart",
-    }
+    WRITE_TOOLS = WRITE_TOOLS
+    READ_TOOLS = READ_TOOLS
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -485,6 +578,7 @@ class StreamableHTTPMCPTransport:
                     "write": tool.name in self.WRITE_TOOLS,
                 }
                 for tool in tools.tools
+                if tool.name in self.READ_TOOLS | self.WRITE_TOOLS
             )
         return discovered
 
@@ -496,6 +590,13 @@ class StreamableHTTPMCPTransport:
     ) -> ToolResult:
         if tool_name in self.WRITE_TOOLS:
             return await self.production.call_tool(tool_name, arguments, context)
+        if tool_name not in self.READ_TOOLS:
+            return ToolResult(
+                False,
+                {"error": f"Tool {tool_name!r} is outside the exact MCP allowlist."},
+                "mcp://denied/error",
+                0,
+            )
         server_name = next(
             (name for prefix, name in self.TOOL_SERVERS.items() if tool_name.startswith(prefix)),
             None,

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,8 +30,10 @@ from .models import (
     PrometheusAlert,
     ToolIntentEdit,
 )
+from .outbox import OutboxDispatcher
 from .postmortem import PostmortemService
 from .security import (
+    RequestBodyLimitMiddleware,
     SecurityManager,
     SecurityMiddleware,
     request_actor,
@@ -50,7 +55,9 @@ store = Store(
     database_pool_min_size=settings.database_pool_min_size,
     database_pool_max_size=settings.database_pool_max_size,
     telemetry=telemetry,
+    outbox_enabled=bool(settings.redis_url),
 )
+outbox = OutboxDispatcher(store, event_stream)
 engine = IncidentEngine(store, settings, event_stream)
 postmortems = PostmortemService(store)
 security = SecurityManager(settings)
@@ -60,20 +67,22 @@ security = SecurityManager(settings)
 async def lifespan(_: FastAPI):
     try:
         await event_stream.connect()
+        await outbox.start()
         await security.connect()
         await engine.connect()
         yield
     finally:
         await engine.close()
         await security.close()
+        await outbox.close()
         await event_stream.close()
-        store.close()
+        await asyncio.to_thread(store.close)
 
 
 app = FastAPI(
     title="RunGuard API",
     description="Trusted Agentic SRE incident response API",
-    version="1.2.0",
+    version="1.2.1",
     lifespan=lifespan,
     docs_url=None if settings.enforce_production_guards else "/docs",
     redoc_url=None if settings.enforce_production_guards else "/redoc",
@@ -88,13 +97,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(
+    RequestBodyLimitMiddleware,
+    max_bytes=settings.max_request_body_bytes,
+)
 
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "1.2.0",
+        "version": "1.2.1",
         "execution_mode": settings.execution_mode,
         "connector_mode": settings.connector_mode,
         "agent_backend": settings.agent_backend,
@@ -103,6 +116,7 @@ def health() -> dict[str, Any]:
         "database_backend": store.backend,
         "database_pool": store.database_pool_stats(),
         "redis_stream": "configured" if event_stream.enabled else "disabled",
+        "outbox_pending": store.outbox_pending_count(),
         "opentelemetry": "configured" if telemetry.endpoint else "disabled",
         "authentication": settings.auth_mode,
         "workflow_checkpoints": settings.langgraph_checkpoint_backend,
@@ -112,8 +126,9 @@ def health() -> dict[str, Any]:
 
 @app.get("/api/ready")
 async def readiness() -> dict[str, Any]:
+    database_status = await asyncio.to_thread(store.database_health)
     components = {
-        "database": store.database_health(),
+        "database": database_status,
         "redis": await event_stream.health(),
         "policy": await engine.policy.health(),
         "authentication": (
@@ -165,6 +180,9 @@ def prometheus_metrics() -> PlainTextResponse:
         "# HELP runguard_trace_spans_total Recorded RunGuard spans.",
         "# TYPE runguard_trace_spans_total gauge",
         f"runguard_trace_spans_total {data['spans']}",
+        "# HELP runguard_outbox_pending Events awaiting Redis Stream delivery.",
+        "# TYPE runguard_outbox_pending gauge",
+        f"runguard_outbox_pending {store.outbox_pending_count()}",
     ]
     for status, count in data["by_status"].items():
         lines.append(f'runguard_incidents_by_status{{status="{status}"}} {count}')
@@ -184,17 +202,20 @@ async def prometheus_alert(
     x_runguard_signature: str | None = Header(default=None),
     x_runguard_timestamp: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    try:
-        verify_webhook_signature(
-            settings.prometheus_webhook_secret,
-            await request.body(),
-            x_runguard_signature,
-            x_runguard_timestamp,
-        )
-    except PermissionError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    if not getattr(request.state, "webhook_verified", False):
+        try:
+            verify_webhook_signature(
+                settings.prometheus_webhook_secret,
+                await request.body(),
+                x_runguard_signature,
+                x_runguard_timestamp,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
     labels = payload.labels
     annotations = payload.annotations
+    if payload.status.strip().lower() != "firing":
+        return {"status": "ignored", "reason": "Only firing alerts create incidents."}
     incident = IncidentCreate(
         title=annotations.get("summary") or labels.get("alertname") or "Prometheus alert",
         severity=labels.get("severity", "P2").upper(),
@@ -202,26 +223,31 @@ async def prometheus_alert(
         environment=labels.get("environment", "staging"),
         description=annotations.get("description", ""),
     )
-    created = store.create_incident(incident, source="prometheus")
-    await event_stream.publish(
-        "incident.created",
-        created["id"],
-        {"source": "prometheus", "severity": created["severity"]},
+    alert_identity = json.dumps(
+        {"labels": labels, "startsAt": payload.startsAt},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )
+    created = await asyncio.to_thread(
+        store.create_incident,
+        incident,
+        source="prometheus",
+        idempotency_key="prometheus:" + hashlib.sha256(alert_identity.encode()).hexdigest(),
+    )
+    if not created.pop("_deduplicated", False):
+        await outbox.flush_once()
     return created
 
 
 @app.post("/api/incidents", status_code=201)
 async def create_incident(request: Request, payload: IncidentCreate) -> dict[str, Any]:
-    created = store.create_incident(
+    created = await asyncio.to_thread(
+        store.create_incident,
         payload,
         source=f"manual:{request_actor(request, 'human-operator')}",
     )
-    await event_stream.publish(
-        "incident.created",
-        created["id"],
-        {"source": "manual", "severity": created["severity"]},
-    )
+    await outbox.flush_once()
     return created
 
 
@@ -241,8 +267,11 @@ async def search_evidence(payload: EvidenceSearchRequest):
 
 
 @app.get("/api/incidents")
-def list_incidents() -> list[dict[str, Any]]:
-    return store.list_incidents()
+def list_incidents(
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0, le=100_000),
+) -> list[dict[str, Any]]:
+    return store.list_incidents(limit=limit, offset=offset)
 
 
 @app.get("/api/incidents/{incident_id}")
@@ -272,22 +301,47 @@ async def resume_incident(incident_id: str) -> dict[str, Any]:
 
 @app.post("/api/incidents/{incident_id}/cancel")
 def cancel_incident(request: Request, incident_id: str) -> dict[str, Any]:
-    return _not_found(
-        store.update_status,
-        incident_id,
-        IncidentStatus.CANCELLED,
-        request_actor(request, "human-operator"),
-    )
+    try:
+        return store.update_status(
+            incident_id,
+            IncidentStatus.CANCELLED,
+            request_actor(request, "human-operator"),
+            allowed_from={
+                "NEW",
+                "TRIAGING",
+                "INVESTIGATING",
+                "PLAN_READY",
+                "POLICY_CHECKING",
+                "WAITING_APPROVAL",
+                "HUMAN_HANDOFF",
+            },
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Incident not found.") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/incidents/{incident_id}/handoff")
 def handoff_incident(request: Request, incident_id: str) -> dict[str, Any]:
-    return _not_found(
-        store.update_status,
-        incident_id,
-        IncidentStatus.HUMAN_HANDOFF,
-        request_actor(request, "human-operator"),
-    )
+    try:
+        return store.update_status(
+            incident_id,
+            IncidentStatus.HUMAN_HANDOFF,
+            request_actor(request, "human-operator"),
+            allowed_from={
+                "NEW",
+                "TRIAGING",
+                "INVESTIGATING",
+                "PLAN_READY",
+                "POLICY_CHECKING",
+                "WAITING_APPROVAL",
+            },
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Incident not found.") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/incidents/{incident_id}/replay")
@@ -340,7 +394,8 @@ async def approve_intent(
 ) -> dict[str, Any]:
     reviewer = request_actor(request, payload.reviewer)
     try:
-        store.decide_approval(
+        await asyncio.to_thread(
+            store.decide_approval,
             intent_id,
             reviewer,
             "approved",
@@ -463,7 +518,8 @@ def export_postmortem(
 
 @app.get("/.well-known/agent-card.json")
 def a2a_agent_card(request: Request) -> dict[str, Any]:
-    return reviewer_agent_card(str(request.base_url).rstrip("/"))
+    base_url = settings.public_base_url or str(request.base_url)
+    return reviewer_agent_card(base_url.rstrip("/"))
 
 
 @app.post("/a2a/reviewer")
@@ -551,7 +607,8 @@ def _not_found(function, *args):
 
 
 def run() -> None:
-    uvicorn.run("runguard_api.main:app", host="0.0.0.0", port=8000, reload=False)
+    # The container must listen on its pod interface; network policy is the perimeter.
+    uvicorn.run("runguard_api.main:app", host="0.0.0.0", port=8000, reload=False)  # nosec B104
 
 
 if __name__ == "__main__":

@@ -1,8 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 import json
-from typing import Any
+import time
+from collections.abc import Awaitable, Callable
+from contextlib import suppress
+from typing import Any, TypeVar
 from uuid import uuid4
+
+T = TypeVar("T")
+
+
+class LockUnavailable(RuntimeError):
+    pass
+
+
+class LockLeaseLost(RuntimeError):
+    pass
 
 
 class EventStream:
@@ -17,12 +31,22 @@ class EventStream:
     def enabled(self) -> bool:
         return bool(self.redis_url)
 
+    @property
+    def ready(self) -> bool:
+        return self._client is not None
+
     async def connect(self) -> None:
         if not self.redis_url:
             return
         from redis.asyncio import Redis
 
-        self._client = Redis.from_url(self.redis_url, decode_responses=True)
+        self._client = Redis.from_url(
+            self.redis_url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            health_check_interval=30,
+        )
         await self._client.ping()
 
     async def close(self) -> None:
@@ -35,6 +59,8 @@ class EventStream:
         event_type: str,
         incident_id: str,
         payload: dict[str, Any],
+        *,
+        event_id: str | None = None,
     ) -> str | None:
         if self._client is None:
             return None
@@ -44,6 +70,7 @@ class EventStream:
                 "event_type": event_type,
                 "incident_id": incident_id,
                 "payload": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                **({"event_id": event_id} if event_id else {}),
             },
             maxlen=100_000,
             approximate=True,
@@ -143,3 +170,82 @@ class EventStream:
         return 0
         """
         await self._client.eval(script, 1, f"runguard:lock:{resource}", token)
+
+    async def renew_lock(
+        self,
+        resource: str,
+        token: str,
+        ttl_seconds: int,
+    ) -> bool:
+        if self._client is None:
+            return True
+        script = """
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+          return redis.call('EXPIRE', KEYS[1], ARGV[2])
+        end
+        return 0
+        """
+        renewed = await self._client.eval(
+            script,
+            1,
+            f"runguard:lock:{resource}",
+            token,
+            ttl_seconds,
+        )
+        return bool(renewed)
+
+    async def run_with_lock(
+        self,
+        resource: str,
+        ttl_seconds: int,
+        operation: Callable[[], Awaitable[T]],
+    ) -> T:
+        token = await self.acquire_lock(resource, ttl_seconds)
+        if token is None:
+            raise LockUnavailable(resource)
+        if self._client is None:
+            try:
+                return await operation()
+            finally:
+                await self.release_lock(resource, token)
+
+        operation_task = asyncio.create_task(operation())
+        renewal_task = asyncio.create_task(
+            self._renew_until_lost(resource, token, ttl_seconds)
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {operation_task, renewal_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if operation_task in done:
+                return await operation_task
+            operation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await operation_task
+            raise LockLeaseLost(resource)
+        finally:
+            renewal_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await renewal_task
+            with suppress(Exception):
+                await self.release_lock(resource, token)
+
+    async def _renew_until_lost(
+        self,
+        resource: str,
+        token: str,
+        ttl_seconds: int,
+    ) -> None:
+        interval = min(max(ttl_seconds / 3, 0.1), 30.0)
+        deadline = time.monotonic() + ttl_seconds
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                renewed = await self.renew_lock(resource, token, ttl_seconds)
+            except Exception:
+                renewed = False
+            if renewed:
+                deadline = time.monotonic() + ttl_seconds
+            elif time.monotonic() >= deadline:
+                return

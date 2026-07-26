@@ -7,7 +7,7 @@ metadata:
 rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    verbs: ["create", "get", "list", "watch", "delete"]
+    verbs: ["create", "get", "list", "watch"]
   - apiGroups: [""]
     resources: ["pods", "pods/log", "events"]
     verbs: ["get", "list", "watch"]
@@ -38,9 +38,12 @@ metadata:
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
-    verbs: ["get", "patch", "update"]
-  - apiGroups: ["apps"]
-    resources: ["deployments/scale"]
+    {{- with .Values.config.targetInventory }}
+    resourceNames:
+      {{- range $service, $target := . }}
+      - {{ required (printf "config.targetInventory.%s.name is required" $service) $target.name | quote }}
+      {{- end }}
+    {{- end }}
     verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

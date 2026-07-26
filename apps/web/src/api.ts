@@ -182,6 +182,23 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function download(path: string, filename: string): Promise<void> {
+  const accessToken = sessionStorage.getItem("runguard-access-token");
+  const response = await fetch(path, {
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ detail: response.statusText }));
+    throw new Error(body.detail || `Request failed (${response.status})`);
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
 export const api = {
   hasAccessToken: () => Boolean(sessionStorage.getItem("runguard-access-token")),
   setAccessToken: (token: string) =>
@@ -225,11 +242,16 @@ export const api = {
       body: JSON.stringify({
         suite: "baseline-12",
         model: "deterministic-demo",
-        prompt_version: "1.2.0",
+        prompt_version: "1.2.1",
       }),
     }),
   postmortem: (incidentId: string) =>
     request<Postmortem>(`/api/incidents/${incidentId}/postmortem`),
   generatePostmortem: (incidentId: string) =>
     request<Postmortem>(`/api/incidents/${incidentId}/postmortem`, { method: "POST" }),
+  exportPostmortem: (incidentId: string) =>
+    download(
+      `/api/incidents/${incidentId}/postmortem/export`,
+      `${incidentId.toLowerCase()}-postmortem.md`,
+    ),
 };

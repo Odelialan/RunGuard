@@ -166,11 +166,11 @@ const ZH: Record<string, string> = {
   "No trace spans recorded": "尚未记录 Trace Span",
   "No traces match these filters": "没有符合筛选条件的 Trace",
   "Evaluation dashboard": "评测仪表盘",
-  "Measured results from fixed, reproducible fault scenarios — never self-reported claims.":
-    "基于固定且可复现故障场景的实测结果，不使用自我声明数据。",
+  "Reference expectations from fixed deterministic fixtures, not production measurements.":
+    "来自固定确定性夹具的参考期望，并非生产实测结果。",
   "Establish the v1.0 baseline": "建立 v1.0 基线",
-  "Run 12 deterministic scenarios to measure diagnosis, policy, and recovery behavior.":
-    "运行 12 个确定性场景，测量诊断、策略和恢复行为。",
+  "Load 12 deterministic fixtures to inspect expected diagnosis and policy behavior.":
+    "载入 12 个确定性夹具，查看预期的诊断与策略行为。",
   "Run baseline": "运行基线评测",
   "BASELINE SCORE": "基线评分",
   "Trusted response quality": "可信响应质量",
@@ -188,7 +188,11 @@ const ZH: Record<string, string> = {
   "P95 duration": "P95 耗时",
   "Tool calls": "工具调用",
   Tokens: "Token 数",
-  "Measured, scoped, reproducible": "可测量、有边界、可复现",
+  "Reference, scoped, reproducible": "参考、有边界、可复现",
+  "Reference fixture — not measured": "参考夹具——并非实测",
+  "These values are bundled expectations for UI and policy-contract demonstrations. They do not execute a model, Kubernetes fault, or worker-recovery experiment.":
+    "这些数值仅是 UI 与策略契约演示所附的期望值，不会执行模型、Kubernetes 故障或 Worker 恢复实验。",
+  "Fixture versioned with the repository": "夹具随仓库进行版本管理",
   "Preview the exact decision before an Agent intent enters the execution path.":
     "在 Agent 意图进入执行路径前预览准确决策。",
   "Tool intent input": "工具执行意图输入",

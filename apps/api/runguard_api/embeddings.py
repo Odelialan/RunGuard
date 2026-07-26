@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .config import Settings
@@ -30,11 +31,19 @@ class EvidenceIndexer:
         if not self.enabled or not documents:
             return
         vectors = await self._model.aembed_documents(documents)
-        for evidence_id, vector in zip(evidence_ids, vectors, strict=True):
-            self.store.upsert_evidence_embedding(evidence_id, vector)
+        await asyncio.gather(
+            *(
+                asyncio.to_thread(
+                    self.store.upsert_evidence_embedding,
+                    evidence_id,
+                    vector,
+                )
+                for evidence_id, vector in zip(evidence_ids, vectors, strict=True)
+            )
+        )
 
     async def search(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
         vector = await self._model.aembed_query(query)
-        return self.store.semantic_evidence(vector, limit)
+        return await asyncio.to_thread(self.store.semantic_evidence, vector, limit)

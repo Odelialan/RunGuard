@@ -45,7 +45,14 @@ class KubernetesJobExecutor:
         started = time.perf_counter()
         try:
             data = await asyncio.to_thread(self._execute_sync, spec, context)
-            ok = data.get("status") == "succeeded"
+            runner_result = data.get("runner_result")
+            ok = (
+                data.get("status") == "succeeded"
+                and isinstance(runner_result, dict)
+                and runner_result.get("ok") is True
+            )
+            if data.get("status") == "succeeded" and not ok:
+                data["error"] = "Executor Job succeeded without a valid successful runner result."
         except Exception as exc:
             data = {"status": "failed", "error": str(exc), "rollback": spec.rollback}
             ok = False
@@ -126,7 +133,8 @@ class KubernetesJobExecutor:
             ),
             security_context=security,
             volume_mounts=[
-                client.V1VolumeMount(name="tmp", mount_path="/tmp"),
+                # The path is backed by a pod-local emptyDir, not the host filesystem.
+                client.V1VolumeMount(name="tmp", mount_path="/tmp"),  # nosec B108
             ],
         )
         template = client.V1PodTemplateSpec(

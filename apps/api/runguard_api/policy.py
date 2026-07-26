@@ -15,7 +15,7 @@ READ_TOOLS = {
     "github.get_deployments",
 }
 
-STAGING_WRITES = {
+WRITE_TOOLS = {
     "kubernetes.patch_deployment",
     "kubernetes.scale_deployment",
     "kubernetes.rollout_restart",
@@ -27,6 +27,18 @@ R3_TOOLS = {
     "shell.execute",
 }
 
+ROLLBACK_FIELDS = {
+    "kubernetes.patch_deployment": {"memory_limit", "cpu_limit"},
+    "kubernetes.scale_deployment": {"replicas"},
+    "kubernetes.rollout_restart": set(),
+}
+
+
+def has_effective_rollback(tool: str, rollback: object) -> bool:
+    if not isinstance(rollback, dict):
+        return False
+    return bool(set(rollback) & ROLLBACK_FIELDS.get(tool.strip().lower(), set()))
+
 
 def classify_risk(
     tool: str,
@@ -34,15 +46,19 @@ def classify_risk(
     arguments: dict[str, object] | None = None,
 ) -> RiskLevel:
     arguments = arguments or {}
+    tool = tool.strip().lower()
+    environment = environment.strip().lower()
     if tool in R3_TOOLS or arguments.get("privileged") is True:
         return RiskLevel.R3
-    if tool in READ_TOOLS or tool.startswith(("prometheus.", "loki.")):
+    if tool in READ_TOOLS:
         return RiskLevel.R0
-    if environment.lower() in {"production", "prod"}:
+    if tool not in WRITE_TOOLS:
+        return RiskLevel.R3
+    if environment in {"production", "prod"}:
         return RiskLevel.R2
-    if tool in STAGING_WRITES:
+    if tool in WRITE_TOOLS:
         return RiskLevel.R1
-    return RiskLevel.R2
+    return RiskLevel.R3
 
 
 def evaluate_policy(
@@ -53,16 +69,17 @@ def evaluate_policy(
         if isinstance(payload, PolicySimulationRequest)
         else dict(payload)
     )
-    risk = data.get("risk_level") or classify_risk(
+    risk = classify_risk(
         data["tool"],
         data["environment"],
         data.get("arguments"),
     )
     risk_value = str(risk)
-    environment = data["environment"].lower()
-    has_rollback = bool(data.get("has_rollback", False))
+    environment = str(data["environment"]).strip().lower()
+    tool = str(data["tool"]).strip().lower()
+    has_rollback = has_effective_rollback(tool, data.get("rollback"))
 
-    if risk_value == "R3":
+    if risk_value == "R3" or tool not in READ_TOOLS | WRITE_TOOLS:
         return {
             "decision": "deny",
             "risk_level": risk_value,
@@ -92,11 +109,22 @@ def evaluate_policy(
             "matched_policy": "write-without-rollback-requires-human",
             "reason": "Write operation has no verified rollback action.",
         }
+    if risk_value == "R0" or (
+        risk_value == "R1"
+        and environment in {"staging", "development", "test", "kind", "runguard-system"}
+        and has_rollback
+    ):
+        return {
+            "decision": "allow",
+            "risk_level": risk_value,
+            "matched_policy": "readonly-or-reversible-staging",
+            "reason": "Operation is read-only or reversible within an isolated environment.",
+        }
     return {
-        "decision": "allow",
+        "decision": "deny",
         "risk_level": risk_value,
-        "matched_policy": "readonly-or-reversible-staging",
-        "reason": "Operation is read-only or reversible within an isolated environment.",
+        "matched_policy": "default-deny",
+        "reason": "No policy allows this tool intent.",
     }
 
 
@@ -126,10 +154,17 @@ class PolicyEvaluator:
             else dict(payload)
         )
         risk = str(
-            data.get("risk_level")
-            or classify_risk(str(data["tool"]), str(data["environment"]), data.get("arguments"))
+            classify_risk(
+                str(data["tool"]),
+                str(data["environment"]),
+                data.get("arguments"),
+            )
         )
         data["risk_level"] = risk
+        data["has_rollback"] = has_effective_rollback(
+            str(data["tool"]),
+            data.get("rollback"),
+        )
         if self.backend != "opa":
             return evaluate_policy(data)
         if not self.opa_url:

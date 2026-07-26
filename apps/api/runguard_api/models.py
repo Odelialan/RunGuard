@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class IncidentStatus(StrEnum):
@@ -44,6 +44,22 @@ class IncidentCreate(BaseModel):
     environment: str = Field(default="staging", min_length=2, max_length=40)
     description: str = Field(default="", max_length=2000)
 
+    @field_validator("title", "service", "environment", mode="before")
+    @classmethod
+    def normalize_identity_fields(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("environment")
+    @classmethod
+    def normalize_environment(cls, value: str) -> str:
+        aliases = {
+            "prod": "production",
+            "stage": "staging",
+            "dev": "development",
+        }
+        normalized = value.strip().lower()
+        return aliases.get(normalized, normalized)
+
 
 class PrometheusAlert(BaseModel):
     status: str = "firing"
@@ -79,17 +95,24 @@ class PolicySimulationRequest(BaseModel):
     role: str = "incident_remediator"
     environment: str
     tool: str
-    resource: str
+    resource: str | dict[str, Any]
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    rollback: dict[str, Any] = Field(default_factory=dict)
     risk_level: RiskLevel | None = None
     has_rollback: bool = True
     edited: bool = False
     incident_severity: Severity = Severity.P2
 
+    @field_validator("environment", "tool")
+    @classmethod
+    def normalize_policy_fields(cls, value: str) -> str:
+        return value.strip().lower()
+
 
 class EvalRunRequest(BaseModel):
     suite: Literal["baseline-12"] = "baseline-12"
     model: str = "deterministic-demo"
-    prompt_version: str = "1.2.0"
+    prompt_version: str = "1.2.1"
 
 
 class PostmortemActionItem(BaseModel):
