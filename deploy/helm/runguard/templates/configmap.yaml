@@ -26,6 +26,7 @@ data:
   RUNGUARD_DATABASE_SEED: {{ .Values.config.databaseSeed | quote }}
   RUNGUARD_DATABASE_POOL_MIN_SIZE: {{ .Values.config.databasePoolMinSize | quote }}
   RUNGUARD_DATABASE_POOL_MAX_SIZE: {{ .Values.config.databasePoolMaxSize | quote }}
+  RUNGUARD_MIGRATIONS_DIR: "/app/deploy/postgres"
   RUNGUARD_EMBEDDINGS_ENABLED: {{ .Values.config.embeddingsEnabled | quote }}
   RUNGUARD_LLM_MODEL: {{ .Values.config.llmModel | quote }}
   RUNGUARD_VERIFICATION_URL_TEMPLATE: {{ .Values.config.verificationUrlTemplate | quote }}

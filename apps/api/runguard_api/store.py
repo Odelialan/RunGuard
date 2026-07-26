@@ -279,9 +279,15 @@ class Store:
 
     @staticmethod
     def _apply_postgres_migrations(connection: _PostgresConnection) -> None:
-        migrations_dir = Path(
-            os.getenv("RUNGUARD_MIGRATIONS_DIR")
-            or str(Path(__file__).resolve().parents[3] / "deploy" / "postgres")
+        configured_dir = os.getenv("RUNGUARD_MIGRATIONS_DIR")
+        candidates = [
+            Path.cwd() / "deploy" / "postgres",
+            Path(__file__).resolve().parents[3] / "deploy" / "postgres",
+        ]
+        migrations_dir = (
+            Path(configured_dir)
+            if configured_dir
+            else next((path for path in candidates if path.is_dir()), candidates[0])
         )
         connection.execute(
             """

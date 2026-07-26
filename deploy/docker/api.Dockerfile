@@ -10,6 +10,7 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     RUNGUARD_DATABASE_PATH=/data/runguard.db \
+    RUNGUARD_MIGRATIONS_DIR=/app/deploy/postgres \
     RUNGUARD_WEB_DIST=/app/apps/web/dist
 
 WORKDIR /app
