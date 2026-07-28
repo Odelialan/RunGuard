@@ -406,6 +406,30 @@ def waiting_reason(name: str, expected: set[str]) -> tuple[bool, dict[str, Any]]
     return reason in expected, observation
 
 
+def crashloop_observation(
+    current: dict[str, Any],
+    expected_exit_code: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Recognize a crash loop without depending on a transient waiting snapshot."""
+
+    statuses = current.get("status", {}).get("containerStatuses") or [{}]
+    status = statuses[0]
+    waiting_reason_value = status.get("state", {}).get("waiting", {}).get("reason")
+    terminated = status.get("lastState", {}).get("terminated") or {}
+    restart_count = status.get("restartCount", 0)
+    observation = {
+        "reason": waiting_reason_value,
+        "last_termination_reason": terminated.get("reason"),
+        "last_exit_code": terminated.get("exitCode"),
+        "restart_count": restart_count,
+    }
+    in_backoff = waiting_reason_value == "CrashLoopBackOff"
+    repeated_expected_crash = (
+        restart_count >= 2 and terminated.get("exitCode") == expected_exit_code
+    )
+    return in_backoff or repeated_expected_crash, observation
+
+
 def run_cases() -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
 
@@ -445,9 +469,7 @@ def run_cases() -> list[dict[str, Any]]:
 
     def crashloop() -> dict[str, Any]:
         apply(pod("crash-loop", ["python", "-c", "raise SystemExit(17)"]))
-        return wait_for(
-            lambda: waiting_reason("crash-loop", {"CrashLoopBackOff"}), 150
-        )
+        return wait_for(lambda: crashloop_observation(get("pod", "crash-loop"), 17), 150)
 
     execute("CASE-02", "CrashLoopBackOff", crashloop)
 

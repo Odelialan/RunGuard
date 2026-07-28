@@ -14,7 +14,7 @@ from .security import RequestBodyLimitMiddleware
 app = FastAPI(
     title="RunGuard Independent Reviewer",
     description="A separately deployable, credential-free A2A remediation reviewer.",
-    version="1.4.1",
+    version="1.4.2",
 )
 app.add_middleware(
     RequestBodyLimitMiddleware,

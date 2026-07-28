@@ -2,14 +2,14 @@
 
 > Agentic SRE 事故响应与可信执行平台
 
-[![Version](https://img.shields.io/badge/version-1.4.1-6ef0b5)](./VERSION)
+[![Version](https://img.shields.io/badge/version-1.4.2-6ef0b5)](./VERSION)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-78aef7)](./pyproject.toml)
 [![React](https://img.shields.io/badge/React-TypeScript-78aef7)](./apps/web/package.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-ac92ff)](./LICENSE)
 
 RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行、效果验证和复盘记录连接为一条可审计的事故响应链路。LLM 只生成结构化 Tool Intent，无法直接获得基础设施凭据；所有写操作必须经过参数校验、风险分级、策略判断、幂等控制与回滚检查。
 
-当前版本：**1.4.1** · 发布日期：**2026-07-28**
+当前版本：**1.4.2** · 发布日期：**2026-07-28**
 作者：**OdeliaLan**
 
 ## 1.4 能力
@@ -378,6 +378,15 @@ RunGuard/
 ```
 
 该脚本会检查 Python 静态规则、前端类型与生产构建、API smoke test、Git 追踪文件大小和常见凭据模式。
+
+## 1.4.2 发布记录
+
+**2026-07-28 · Live evaluation determinism**
+
+- CrashLoop 实验同时接受瞬时 `CrashLoopBackOff` 状态，或至少两次相同非零退出码
+  的受控重启证据，避免因轮询恰好落在 container state 切换窗口而产生假阴性。
+- 增加纯函数回归测试，保证单次崩溃或非预期退出码不能被误判为 CrashLoop。
+- `v1.4.1` 保持不可变并保留其失败 CI 证据；本补丁使用新版本发布。
 
 ## 1.4.1 发布记录
 

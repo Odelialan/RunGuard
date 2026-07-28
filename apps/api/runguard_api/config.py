@@ -157,7 +157,7 @@ def load_settings() -> Settings:
         ),
         target_inventory_json=os.getenv("RUNGUARD_TARGET_INVENTORY_JSON", "{}"),
         kubernetes_runner_image=os.getenv(
-            "RUNGUARD_KUBERNETES_RUNNER_IMAGE", "ghcr.io/odelialan/runguard-runner:1.4.1"
+            "RUNGUARD_KUBERNETES_RUNNER_IMAGE", "ghcr.io/odelialan/runguard-runner:1.4.2"
         ),
         kubernetes_service_account=os.getenv(
             "RUNGUARD_KUBERNETES_SERVICE_ACCOUNT", "runguard-executor"

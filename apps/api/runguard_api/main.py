@@ -82,7 +82,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="RunGuard API",
     description="Trusted Agentic SRE incident response API",
-    version="1.4.1",
+    version="1.4.2",
     lifespan=lifespan,
     docs_url=None if settings.enforce_production_guards else "/docs",
     redoc_url=None if settings.enforce_production_guards else "/redoc",
@@ -107,7 +107,7 @@ app.add_middleware(
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "1.4.1",
+        "version": "1.4.2",
     }
 
 
