@@ -257,7 +257,7 @@ jobs:
             "SELECT to_regclass('public.workflow_checkpoints')" \
             | grep -qx workflow_checkpoints
           EVENT_ID="$(docker exec postgres psql -U runguard -d runguard -Atc \
-            "SELECT id FROM incident_events ORDER BY occurred_at LIMIT 1")"
+            "SELECT id FROM incident_events ORDER BY created_at LIMIT 1")"
           test -n "$EVENT_ID"
           if docker exec postgres psql -v ON_ERROR_STOP=1 -U runguard -d runguard \
             -c "UPDATE incident_events SET actor='tampered' WHERE id='$EVENT_ID'"; then
