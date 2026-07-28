@@ -26,7 +26,7 @@ from runguard_api.policy import PolicyEvaluator
 from runguard_api.reviewer_service import app as reviewer_app
 from runguard_api.runner import _set_http_route_weights
 from runguard_api.security import SecurityManager, SecurityMiddleware
-from runguard_api.store import Store
+from runguard_api.store import Store, _split_postgres_statements
 
 
 def settings_for(
@@ -42,6 +42,39 @@ def settings_for(
     monkeypatch.setenv("RUNGUARD_AUTH_MODE", "disabled")
     settings = load_settings()
     return replace(settings, **overrides)
+
+
+def test_postgres_migration_splitter_preserves_plpgsql_function_body() -> None:
+    migration = (
+        Path(__file__).resolve().parents[1]
+        / "deploy"
+        / "postgres"
+        / "006_reject_incident_event_mutation.sql"
+    ).read_text(encoding="utf-8")
+
+    statements = _split_postgres_statements(migration)
+
+    assert len(statements) == 5
+    function = statements[2]
+    assert function.startswith("CREATE OR REPLACE FUNCTION")
+    assert "RAISE EXCEPTION 'incident_events is append-only; % is forbidden', TG_OP" in function
+    assert "USING ERRCODE = '55000';" in function
+    assert function.endswith("$$")
+
+
+def test_postgres_migration_splitter_ignores_quoted_and_commented_semicolons() -> None:
+    statements = _split_postgres_statements(
+        """
+        -- an ignored ; delimiter
+        SELECT ';' AS "semi;colon";
+        /* outer ; /* nested ; */ still comment ; */
+        DO $body$ BEGIN PERFORM 1; END; $body$;
+        """
+    )
+
+    assert len(statements) == 2
+    assert "SELECT ';'" in statements[0]
+    assert "PERFORM 1; END;" in statements[1]
 
 
 @pytest.mark.asyncio

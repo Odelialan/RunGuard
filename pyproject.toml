@@ -1,6 +1,6 @@
 [project]
 name = "runguard"
-version = "1.4.0"
+version = "1.4.1"
 description = "Agentic SRE incident response and trusted execution platform"
 readme = "README.md"
 requires-python = ">=3.11"

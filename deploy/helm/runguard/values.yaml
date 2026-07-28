@@ -2,18 +2,18 @@ replicaCount: 2
 
 image:
   repository: ghcr.io/odelialan/runguard
-  tag: "1.4.0"
+  tag: "1.4.1"
   digest: ""
   pullPolicy: IfNotPresent
 
 runnerImage:
   repository: ghcr.io/odelialan/runguard-runner
-  tag: "1.4.0"
+  tag: "1.4.1"
   digest: ""
 
 reviewerImage:
   repository: ghcr.io/odelialan/runguard-reviewer
-  tag: "1.4.0"
+  tag: "1.4.1"
   digest: ""
 
 service:

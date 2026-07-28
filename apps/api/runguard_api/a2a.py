@@ -18,7 +18,7 @@ def reviewer_agent_card(base_url: str) -> dict[str, Any]:
         "additionalInterfaces": [
             {"url": f"{base_url.rstrip('/')}/a2a/reviewer", "transport": "JSONRPC"}
         ],
-        "version": "1.4.0",
+        "version": "1.4.1",
         "capabilities": {"streaming": False, "pushNotifications": False},
         "defaultInputModes": ["application/json", "text/plain"],
         "defaultOutputModes": ["application/json", "text/plain"],

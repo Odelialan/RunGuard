@@ -2,14 +2,14 @@
 
 > Agentic SRE 事故响应与可信执行平台
 
-[![Version](https://img.shields.io/badge/version-1.4.0-6ef0b5)](./VERSION)
+[![Version](https://img.shields.io/badge/version-1.4.1-6ef0b5)](./VERSION)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-78aef7)](./pyproject.toml)
 [![React](https://img.shields.io/badge/React-TypeScript-78aef7)](./apps/web/package.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-ac92ff)](./LICENSE)
 
 RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行、效果验证和复盘记录连接为一条可审计的事故响应链路。LLM 只生成结构化 Tool Intent，无法直接获得基础设施凭据；所有写操作必须经过参数校验、风险分级、策略判断、幂等控制与回滚检查。
 
-当前版本：**1.4.0** · 发布日期：**2026-07-28**
+当前版本：**1.4.1** · 发布日期：**2026-07-28**
 作者：**OdeliaLan**
 
 ## 1.4 能力
@@ -378,6 +378,18 @@ RunGuard/
 ```
 
 该脚本会检查 Python 静态规则、前端类型与生产构建、API smoke test、Git 追踪文件大小和常见凭据模式。
+
+## 1.4.1 发布记录
+
+**2026-07-28 · PostgreSQL 与构建链补丁**
+
+- 修复 PostgreSQL 迁移执行器：按 SQL 词法边界识别字符串、标识符、注释和
+  dollar-quoted PL/pgSQL 函数体，不再用普通分号切割破坏触发器迁移。
+- 增加迁移切分回归测试，覆盖嵌套块注释、引号内分号和具名 dollar quote。
+- 修正 live Kubernetes 评测对空 EndpointSlice 的解析，并约束 PostgreSQL 实验
+  实例的 WAL sender/保留连接，使连接池用例测量真实拒绝连接而不是启动失败。
+- 将 GitHub Actions 升级到 Node 24 原生版本并继续固定不可变 commit SHA。
+- Prompt 与 OPA Policy 内容未变，其独立版本保持 `1.4.0`。
 
 ## 1.4.0 发布记录
 

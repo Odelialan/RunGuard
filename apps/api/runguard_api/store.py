@@ -24,6 +24,107 @@ def json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
+def _split_postgres_statements(script: str) -> list[str]:
+    """Split SQL only at top-level semicolons.
+
+    PostgreSQL migrations may contain semicolons inside quoted strings,
+    comments, identifiers, and dollar-quoted PL/pgSQL bodies. A plain
+    ``str.split(";")`` corrupts those statements before they reach the server.
+    """
+
+    statements: list[str] = []
+    start = 0
+    index = 0
+    in_single_quote = False
+    in_double_quote = False
+    in_line_comment = False
+    block_comment_depth = 0
+    dollar_tag: str | None = None
+
+    while index < len(script):
+        if in_line_comment:
+            if script[index] in "\r\n":
+                in_line_comment = False
+            index += 1
+            continue
+
+        if block_comment_depth:
+            if script.startswith("/*", index):
+                block_comment_depth += 1
+                index += 2
+            elif script.startswith("*/", index):
+                block_comment_depth -= 1
+                index += 2
+            else:
+                index += 1
+            continue
+
+        if dollar_tag is not None:
+            if script.startswith(dollar_tag, index):
+                index += len(dollar_tag)
+                dollar_tag = None
+            else:
+                index += 1
+            continue
+
+        character = script[index]
+        if in_single_quote:
+            if character == "'" and index + 1 < len(script) and script[index + 1] == "'":
+                index += 2
+            elif character == "\\" and index + 1 < len(script):
+                index += 2
+            elif character == "'":
+                in_single_quote = False
+                index += 1
+            else:
+                index += 1
+            continue
+
+        if in_double_quote:
+            if character == '"' and index + 1 < len(script) and script[index + 1] == '"':
+                index += 2
+            elif character == '"':
+                in_double_quote = False
+                index += 1
+            else:
+                index += 1
+            continue
+
+        if script.startswith("--", index):
+            in_line_comment = True
+            index += 2
+            continue
+        if script.startswith("/*", index):
+            block_comment_depth = 1
+            index += 2
+            continue
+        if character == "'":
+            in_single_quote = True
+            index += 1
+            continue
+        if character == '"':
+            in_double_quote = True
+            index += 1
+            continue
+        if character == "$":
+            match = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", script[index:])
+            if match:
+                dollar_tag = match.group(0)
+                index += len(dollar_tag)
+                continue
+        if character == ";":
+            statement = script[start:index].strip()
+            if statement:
+                statements.append(statement)
+            start = index + 1
+        index += 1
+
+    tail = script[start:].strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
 class _PostgresConnection:
     def __init__(self, pool: Any) -> None:
         self.pool = pool
@@ -51,9 +152,8 @@ class _PostgresConnection:
         return self.raw.execute(self._query(query, parameters), parameters, prepare=False)
 
     def executescript(self, script: str) -> None:
-        for statement in script.split(";"):
-            if statement.strip():
-                self.raw.execute(statement, prepare=False)
+        for statement in _split_postgres_statements(script):
+            self.raw.execute(statement, prepare=False)
 
 
 class Store:

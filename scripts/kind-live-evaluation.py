@@ -117,12 +117,24 @@ def postgres_pod(name: str, max_connections: int) -> dict[str, Any]:
                 {
                     "name": "postgres",
                     "image": POSTGRES_IMAGE,
-                    "args": ["postgres", "-c", f"max_connections={max_connections}"],
+                    "args": [
+                        "postgres",
+                        "-c",
+                        f"max_connections={max_connections}",
+                        "-c",
+                        "max_wal_senders=0",
+                        "-c",
+                        "superuser_reserved_connections=1",
+                    ],
                     "env": [
                         {
                             "name": "POSTGRES_PASSWORD",
                             "value": "isolated-evaluation-only",
-                        }
+                        },
+                        {
+                            "name": "PGDATA",
+                            "value": "/var/lib/postgresql/data/pgdata",
+                        },
                     ],
                     "volumeMounts": [
                         {
@@ -353,9 +365,9 @@ def recover_cases(cases: list[dict[str, Any]]) -> None:
             )
             addresses = [
                 address
-                for item in json.loads(raw).get("items", [])
-                for endpoint in item.get("endpoints", [])
-                for address in endpoint.get("addresses", [])
+                for item in (json.loads(raw).get("items") or [])
+                for endpoint in (item.get("endpoints") or [])
+                for address in (endpoint.get("addresses") or [])
             ]
             return bool(addresses), {"endpoint_addresses": addresses}
 
@@ -666,9 +678,9 @@ def run_cases() -> list[dict[str, Any]]:
             slices = json.loads(raw).get("items", [])
             addresses = [
                 address
-                for item in slices
-                for endpoint in item.get("endpoints", [])
-                for address in endpoint.get("addresses", [])
+                for item in (slices or [])
+                for endpoint in (item.get("endpoints") or [])
+                for address in (endpoint.get("addresses") or [])
             ]
             item = {"endpoint_addresses": addresses}
             return not addresses, item
