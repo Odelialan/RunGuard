@@ -807,7 +807,14 @@ function IncidentsPage({
             />
           </div>
           <div className="filter-tabs">
-            {["ALL", "NEW", "INVESTIGATING", "WAITING_APPROVAL", "RESOLVED"].map((status) => (
+            {[
+              "ALL",
+              "NEW",
+              "INVESTIGATING",
+              "WAITING_APPROVAL",
+              "SHADOWED",
+              "RESOLVED",
+            ].map((status) => (
               <button
                 key={status}
                 className={filter === status ? "active" : ""}
@@ -933,7 +940,10 @@ function IncidentWorkspace({
 
   if (!incident) return <LoadingState />;
   const latestRun = incident.runs?.[0];
-  const activeStep = STATUS_ORDER.indexOf(incident.status);
+  const activeStep =
+    incident.status === "SHADOWED"
+      ? STATUS_ORDER.indexOf("EXECUTING")
+      : STATUS_ORDER.indexOf(incident.status);
   const canStart = ["NEW", "INVESTIGATING", "HUMAN_HANDOFF"].includes(incident.status);
 
   return (
@@ -1017,7 +1027,7 @@ function IncidentWorkspace({
         <aside className="workspace-side">
           <div className="panel run-summary">
             <PanelHeader title="Run telemetry" subtitle={latestRun?.id ?? "No run started"} />
-            <SummaryStat icon={Sparkles} label="Prompt version" value={latestRun?.prompt_version ?? "1.2.1"} />
+            <SummaryStat icon={Sparkles} label="Prompt version" value={latestRun?.prompt_version ?? "1.4.0"} />
             <SummaryStat icon={Code2} label="Tokens" value={formatNumber(latestRun?.token_usage ?? 0)} />
             <SummaryStat icon={TerminalSquare} label="Tool calls" value={String(latestRun?.tool_calls ?? 0)} />
             <SummaryStat
@@ -1571,6 +1581,7 @@ function EvaluationDashboard({
     }
   };
   const metrics = latest?.metrics;
+  const contractScore = Number(metrics?.contract_pass_rate ?? 0);
   return (
     <div className="page-stack">
       <section className="page-intro slim">
@@ -1579,7 +1590,7 @@ function EvaluationDashboard({
             <BarChart3 size={14} /> RELIABILITY EVALUATION
           </div>
           <h1>Evaluation dashboard</h1>
-          <p>Reference expectations from fixed deterministic fixtures, not production measurements.</p>
+          <p>Measured policy, evidence-security, and side-effect-free replay contracts.</p>
         </div>
         <button className="primary-button" onClick={() => void runSuite()} disabled={busy}>
           {busy ? <RefreshCcw size={16} className="spin" /> : <Play size={16} />}
@@ -1592,7 +1603,7 @@ function EvaluationDashboard({
             <BarChart3 size={34} />
           </div>
           <h2>Establish the v1.0 baseline</h2>
-          <p>Load 12 deterministic fixtures to inspect expected diagnosis and policy behavior.</p>
+          <p>Execute 12 deterministic contracts against the current policy and security code.</p>
           <button className="primary-button" onClick={() => void runSuite()} disabled={busy}>
             Run evaluation
           </button>
@@ -1609,29 +1620,35 @@ function EvaluationDashboard({
                     cy="60"
                     r="50"
                     style={{
-                      strokeDashoffset: `${314 - (314 * Number(metrics?.top1_root_cause_accuracy)) / 100}`,
+                      strokeDashoffset: `${314 - (314 * contractScore) / 100}`,
                     }}
                   />
                 </svg>
                 <div>
-                  <strong>{String(metrics?.top1_root_cause_accuracy)}%</strong>
-                  <span>Top-1 RCA</span>
+                  <strong>{contractScore}%</strong>
+                  <span>Contract pass</span>
                 </div>
               </div>
               <div>
                 <span>BASELINE SCORE</span>
                 <h2>Trusted response quality</h2>
                 <p>
-                  Static fixture · prompt {latest.prompt_version} · {latest.cases.length}{" "}
-                  fixed cases
+                  Executable contract · prompt {latest.prompt_version} · {latest.cases.length}{" "}
+                  measured cases
                 </p>
               </div>
             </div>
             <div className="evaluation-kpis">
               <EvalKpi label="Policy accuracy" value={`${metrics?.policy_decision_accuracy}%`} />
               <EvalKpi label="R3 block rate" value={`${metrics?.dangerous_action_block_rate}%`} />
-              <EvalKpi label="Trace coverage" value={`${metrics?.trace_coverage}%`} />
-              <EvalKpi label="Duplicate effects" value={String(metrics?.duplicate_side_effects)} />
+              <EvalKpi
+                label="Evidence security"
+                value={`${metrics?.evidence_security_pass_rate}%`}
+              />
+              <EvalKpi
+                label="Recorded replay"
+                value={`${metrics?.recorded_replay_pass_rate}%`}
+              />
             </div>
           </section>
           <section className="evaluation-grid">
@@ -1654,7 +1671,11 @@ function EvaluationDashboard({
                       <strong>{String(testCase.name)}</strong>
                       <small>{String(testCase.id)}</small>
                     </span>
-                    <span>{testCase.top1_correct ? "Top-1 match" : "Top-3 match"}</span>
+                      <span>
+                        {testCase.root_cause_contract_passed
+                          ? "Contract match"
+                          : "Contract mismatch"}
+                      </span>
                     <span>{String(testCase.actual_policy_decision).replace("_", " ")}</span>
                     <span>{String(testCase.tool_calls)}</span>
                     <span className={testCase.status === "PASS" ? "case-pass" : "case-partial"}>
@@ -1687,21 +1708,21 @@ function EvaluationDashboard({
                   suffix="s"
                 />
                 <BreakdownBar
-                  label="Valid arguments"
-                  value={Number(metrics?.valid_tool_arguments)}
+                  label="Evidence security"
+                  value={Number(metrics?.evidence_security_pass_rate)}
                   max={100}
                   suffix="%"
                 />
               </div>
               <div className="panel measured-note">
                 <Fingerprint size={25} />
-                <strong>Reference fixture — not measured</strong>
+                <strong>Measured contract — scoped</strong>
                 <p>
-                  These values are bundled expectations for UI and policy-contract demonstrations.
-                  They do not execute a model, Kubernetes fault, or worker-recovery experiment.
+                  The suite executes current policy, evidence sanitization, injection detection,
+                  and Recorded replay code. It does not claim live fault or model quality.
                 </p>
                 <span>
-                  <Check size={13} /> Fixture versioned with the repository
+                  <Check size={13} /> Scope and raw case results are recorded
                 </span>
               </div>
             </aside>
@@ -1720,7 +1741,9 @@ function PostmortemPage({
   showToast: (toast: Toast) => void;
 }) {
   const candidates = incidents.filter((incident) =>
-    ["RESOLVED", "ROLLED_BACK", "HUMAN_HANDOFF"].includes(incident.status),
+    ["RESOLVED", "ROLLED_BACK", "SHADOWED", "HUMAN_HANDOFF"].includes(
+      incident.status,
+    ),
   );
   const [selected, setSelected] = useState<string>(candidates[0]?.id ?? "");
   const [document, setDocument] = useState<Postmortem | null>(null);
@@ -1921,7 +1944,7 @@ function PolicySimulator({ showToast }: { showToast: (toast: Toast) => void }) {
           <h1>Policy simulator</h1>
           <p>Preview the exact decision before an Agent intent enters the execution path.</p>
         </div>
-        <span className="version-chip">policy · 1.2.1 · active</span>
+        <span className="version-chip">policy · 1.4.0 · active</span>
       </section>
       <section className="policy-layout">
         <div className="panel policy-form">

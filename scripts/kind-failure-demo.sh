@@ -28,7 +28,7 @@ incident_json="$(
       "title": "kind order-api injected health failure",
       "severity": "P2",
       "service": "order-api",
-      "environment": "runguard-system",
+      "environment": "staging",
       "description": "Fault injector reports unhealthy to exercise compensation."
     }'
 )"

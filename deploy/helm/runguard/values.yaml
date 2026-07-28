@@ -2,13 +2,18 @@ replicaCount: 2
 
 image:
   repository: ghcr.io/odelialan/runguard
-  tag: "1.2.1"
+  tag: "1.4.0"
   digest: ""
   pullPolicy: IfNotPresent
 
 runnerImage:
   repository: ghcr.io/odelialan/runguard-runner
-  tag: "1.2.1"
+  tag: "1.4.0"
+  digest: ""
+
+reviewerImage:
+  repository: ghcr.io/odelialan/runguard-reviewer
+  tag: "1.4.0"
   digest: ""
 
 service:
@@ -27,6 +32,8 @@ config:
   connectorMode: production
   agentBackend: langgraph
   executionMode: kubernetes_job
+  executionStrategy: direct
+  canaryTrafficSteps: 5,25,50
   policyBackend: opa
   opaUrl: http://opa.runguard-system.svc:8181
   prometheusUrl: http://prometheus.monitoring.svc:9090
@@ -50,10 +57,17 @@ config:
   checkpointBackend: postgres
   autoRecover: true
   recoveryConcurrency: 4
+  incidentToolCallBudget: 24
+  incidentTimeoutSeconds: 900
+  incidentTokenBudgetPerCall: 4096
+  incidentTokenBudgetTotal: 100000
+  incidentMemoryLimit: 5
   corsOrigins: https://runguard.example.com
   corsOriginRegex: ""
   publicBaseUrl: https://runguard.example.com
+  egressProxyUrl: http://egress-gateway.egress-system.svc:8443
   maxRequestBodyBytes: 1048576
+  protectDiagnostics: true
 
 auth:
   mode: oidc
@@ -63,6 +77,7 @@ auth:
   oidcAlgorithms: RS256
   oidcRolesClaim: roles
   rateLimitPerMinute: 120
+  preauthRateLimitPerMinute: 30
 
 secrets:
   existingSecret: ""
@@ -76,6 +91,7 @@ secrets:
   mcpKubernetesToken: ""
   mcpGitHubToken: ""
   a2aReviewerToken: ""
+  diagnosticsToken: ""
   apiKeysJson: ""
   prometheusWebhookSecret: ""
   langgraphAesKey: ""
@@ -103,10 +119,33 @@ networkPolicy:
   ingressNamespaces:
     - ingress-nginx
     - monitoring
+  dependencyNamespaces:
+    - monitoring
+    - observability
+  externalHttps:
+    mode: egressGateway
+    gatewayNamespace: egress-system
+    gatewayPodLabels:
+      app.kubernetes.io/name: egress-gateway
+    gatewayPort: 8443
+  kubernetesApiCidrs:
+    - 10.96.0.1/32
 
 serviceMonitor:
   enabled: false
   interval: 30s
+
+reviewer:
+  enabled: false
+  publicBaseUrl: ""
+  replicas: 2
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
 
 serviceAccount:
   create: true

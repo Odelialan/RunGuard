@@ -136,7 +136,7 @@ export type EvalRun = {
   model: string;
   prompt_version: string;
   status: string;
-  metrics: Record<string, number | string | boolean>;
+  metrics: Record<string, number | string | boolean | null>;
   cases: Array<Record<string, string | number | boolean>>;
   created_at: string;
 };
@@ -242,7 +242,7 @@ export const api = {
       body: JSON.stringify({
         suite: "baseline-12",
         model: "deterministic-demo",
-        prompt_version: "1.2.1",
+        prompt_version: "1.4.0",
       }),
     }),
   postmortem: (incidentId: string) =>

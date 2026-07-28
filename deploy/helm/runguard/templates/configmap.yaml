@@ -1,3 +1,7 @@
+{{- $reviewerURL := .Values.config.a2aReviewerUrl -}}
+{{- if and .Values.reviewer.enabled (not $reviewerURL) -}}
+{{- $reviewerURL = printf "http://%s-reviewer.%s.svc/a2a/reviewer" (include "runguard.fullname" .) .Release.Namespace -}}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -10,6 +14,8 @@ data:
   RUNGUARD_CONNECTOR_MODE: {{ .Values.config.connectorMode | quote }}
   RUNGUARD_AGENT_BACKEND: {{ .Values.config.agentBackend | quote }}
   RUNGUARD_EXECUTION_MODE: {{ .Values.config.executionMode | quote }}
+  RUNGUARD_EXECUTION_STRATEGY: {{ .Values.config.executionStrategy | quote }}
+  RUNGUARD_CANARY_TRAFFIC_STEPS: {{ .Values.config.canaryTrafficSteps | quote }}
   RUNGUARD_POLICY_BACKEND: {{ .Values.config.policyBackend | quote }}
   RUNGUARD_OPA_URL: {{ .Values.config.opaUrl | quote }}
   RUNGUARD_OPA_FAIL_CLOSED: "true"
@@ -20,7 +26,7 @@ data:
   RUNGUARD_MCP_LOKI_URL: {{ .Values.config.mcpLokiUrl | quote }}
   RUNGUARD_MCP_KUBERNETES_URL: {{ .Values.config.mcpKubernetesUrl | quote }}
   RUNGUARD_MCP_GITHUB_URL: {{ .Values.config.mcpGitHubUrl | quote }}
-  RUNGUARD_A2A_REVIEWER_URL: {{ .Values.config.a2aReviewerUrl | quote }}
+  RUNGUARD_A2A_REVIEWER_URL: {{ if .Values.config.enforceProductionGuards }}{{ required "config.a2aReviewerUrl or reviewer.enabled is required in production" $reviewerURL | quote }}{{ else }}{{ $reviewerURL | quote }}{{ end }}
   RUNGUARD_REDIS_URL: {{ .Values.config.redisUrl | quote }}
   RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.config.otelEndpoint | quote }}
   RUNGUARD_DATABASE_SEED: {{ .Values.config.databaseSeed | quote }}
@@ -33,10 +39,20 @@ data:
   RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND: {{ .Values.config.checkpointBackend | quote }}
   RUNGUARD_AUTO_RECOVER: {{ .Values.config.autoRecover | quote }}
   RUNGUARD_RECOVERY_CONCURRENCY: {{ .Values.config.recoveryConcurrency | quote }}
+  RUNGUARD_INCIDENT_TOOL_CALL_BUDGET: {{ .Values.config.incidentToolCallBudget | quote }}
+  RUNGUARD_INCIDENT_TIMEOUT_SECONDS: {{ .Values.config.incidentTimeoutSeconds | quote }}
+  RUNGUARD_INCIDENT_TOKEN_BUDGET_PER_CALL: {{ .Values.config.incidentTokenBudgetPerCall | quote }}
+  RUNGUARD_INCIDENT_TOKEN_BUDGET_TOTAL: {{ .Values.config.incidentTokenBudgetTotal | quote }}
+  RUNGUARD_INCIDENT_MEMORY_LIMIT: {{ .Values.config.incidentMemoryLimit | quote }}
   RUNGUARD_CORS_ORIGINS: {{ .Values.config.corsOrigins | quote }}
   RUNGUARD_CORS_ORIGIN_REGEX: {{ .Values.config.corsOriginRegex | quote }}
   RUNGUARD_PUBLIC_BASE_URL: {{ if .Values.config.enforceProductionGuards }}{{ required "config.publicBaseUrl is required in production" .Values.config.publicBaseUrl | quote }}{{ else }}{{ .Values.config.publicBaseUrl | default "" | quote }}{{ end }}
+  RUNGUARD_EGRESS_PROXY_URL: {{ if .Values.config.enforceProductionGuards }}{{ required "config.egressProxyUrl is required in production" .Values.config.egressProxyUrl | quote }}{{ else }}{{ .Values.config.egressProxyUrl | default "" | quote }}{{ end }}
+  HTTPS_PROXY: {{ .Values.config.egressProxyUrl | default "" | quote }}
+  HTTP_PROXY: {{ .Values.config.egressProxyUrl | default "" | quote }}
+  NO_PROXY: "127.0.0.1,localhost,.svc,.cluster.local,kubernetes.default.svc"
   RUNGUARD_MAX_REQUEST_BODY_BYTES: {{ .Values.config.maxRequestBodyBytes | int | quote }}
+  RUNGUARD_PROTECT_DIAGNOSTICS: {{ .Values.config.protectDiagnostics | quote }}
   RUNGUARD_AUTH_MODE: {{ .Values.auth.mode | quote }}
   RUNGUARD_OIDC_ISSUER: {{ if eq .Values.auth.mode "oidc" }}{{ required "auth.oidcIssuer is required for OIDC" .Values.auth.oidcIssuer | quote }}{{ else }}""{{ end }}
   RUNGUARD_OIDC_AUDIENCE: {{ if eq .Values.auth.mode "oidc" }}{{ required "auth.oidcAudience is required for OIDC" .Values.auth.oidcAudience | quote }}{{ else }}""{{ end }}
@@ -44,6 +60,7 @@ data:
   RUNGUARD_OIDC_ALGORITHMS: {{ .Values.auth.oidcAlgorithms | quote }}
   RUNGUARD_OIDC_ROLES_CLAIM: {{ .Values.auth.oidcRolesClaim | quote }}
   RUNGUARD_RATE_LIMIT_PER_MINUTE: {{ .Values.auth.rateLimitPerMinute | quote }}
+  RUNGUARD_PREAUTH_RATE_LIMIT_PER_MINUTE: {{ .Values.auth.preauthRateLimitPerMinute | quote }}
   RUNGUARD_KUBERNETES_NAMESPACE: {{ .Release.Namespace | quote }}
   RUNGUARD_KUBERNETES_ALLOWED_NAMESPACES: {{ .Values.config.allowedNamespaces | default .Release.Namespace | quote }}
   RUNGUARD_TARGET_INVENTORY_JSON: {{ if .Values.config.enforceProductionGuards }}{{ required "config.targetInventory is required in production" .Values.config.targetInventory | toJson | quote }}{{ else }}{{ .Values.config.targetInventory | default dict | toJson | quote }}{{ end }}

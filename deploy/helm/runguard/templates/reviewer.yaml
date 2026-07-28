@@ -1,0 +1,82 @@
+{{- if .Values.reviewer.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "runguard.fullname" . }}-reviewer
+  labels:
+    {{- include "runguard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reviewer
+spec:
+  replicas: {{ .Values.reviewer.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "runguard.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: reviewer
+  template:
+    metadata:
+      labels:
+        {{- include "runguard.labels" . | nindent 8 }}
+        app.kubernetes.io/component: reviewer
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: reviewer
+          image: {{ if .Values.config.enforceProductionGuards }}{{ printf "%s@%s" .Values.reviewerImage.repository (required "reviewerImage.digest is required when reviewer is enabled in production" .Values.reviewerImage.digest) | quote }}{{ else }}{{ printf "%s:%s" .Values.reviewerImage.repository .Values.reviewerImage.tag | quote }}{{ end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: reviewer
+              containerPort: 8001
+          env:
+            - name: RUNGUARD_A2A_REVIEWER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.existingSecret | default (include "runguard.fullname" .) }}
+                  key: RUNGUARD_A2A_REVIEWER_TOKEN
+            - name: RUNGUARD_REVIEWER_PUBLIC_BASE_URL
+              value: {{ .Values.reviewer.publicBaseUrl | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.reviewer.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: reviewer
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: reviewer
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "runguard.fullname" . }}-reviewer
+  labels:
+    {{- include "runguard.labels" . | nindent 4 }}
+    app.kubernetes.io/component: reviewer
+spec:
+  selector:
+    app.kubernetes.io/name: {{ include "runguard.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: reviewer
+  ports:
+    - name: reviewer
+      port: 80
+      targetPort: reviewer
+{{- end }}

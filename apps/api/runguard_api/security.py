@@ -156,6 +156,10 @@ class SecurityManager:
             settings.redis_url,
             settings.rate_limit_per_minute,
         )
+        self.preauth_rate_limiter = RateLimiter(
+            settings.redis_url,
+            settings.preauth_rate_limit_per_minute,
+        )
         self._api_keys = self._load_api_keys(settings.api_keys_json)
         self._jwks = (
             PyJWKClient(settings.oidc_jwks_url)
@@ -165,9 +169,11 @@ class SecurityManager:
 
     async def connect(self) -> None:
         await self.rate_limiter.connect()
+        await self.preauth_rate_limiter.connect()
 
     async def close(self) -> None:
         await self.rate_limiter.close()
+        await self.preauth_rate_limiter.close()
 
     @staticmethod
     def _load_api_keys(raw: str) -> list[tuple[str, AuthContext]]:
@@ -313,6 +319,18 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             request_id = uuid4().hex
         required = required_role(request)
         context = AuthContext("public", frozenset(), "public")
+        client_host = request.client.host if request.client else "unknown"
+        if (
+            request.url.path in {"/api/ready", "/metrics"}
+            and self.manager.settings.protect_diagnostics
+        ):
+            supplied = request.headers.get("x-runguard-diagnostics-token", "")
+            authorization = request.headers.get("authorization", "")
+            if not supplied and authorization.startswith("Bearer "):
+                supplied = authorization.removeprefix("Bearer ").strip()
+            expected = self.manager.settings.diagnostics_token or ""
+            if not supplied or not hmac.compare_digest(supplied, expected):
+                return self._error(401, "Valid diagnostics token required.", request_id)
         if request.url.path == "/api/alerts/prometheus":
             try:
                 verify_webhook_signature(
@@ -325,6 +343,26 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                 return self._error(401, str(exc), request_id)
             request.state.webhook_verified = True
         if required:
+            try:
+                allowed, _, reset = await self.manager.preauth_rate_limiter.check(
+                    f"preauth:{client_host}"
+                )
+            except Exception:
+                return self._error(
+                    503,
+                    "Distributed pre-authentication limiter is unavailable.",
+                    request_id,
+                )
+            if not allowed:
+                response = self._error(
+                    429,
+                    "Pre-authentication rate limit exceeded.",
+                    request_id,
+                )
+                response.headers["Retry-After"] = str(
+                    max(reset - int(time.time()), 1)
+                )
+                return response
             try:
                 context = await self.manager.authenticate(request)
             except (PermissionError, jwt.PyJWTError) as exc:
@@ -344,7 +382,6 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                 response.headers["Retry-After"] = str(max(reset - int(time.time()), 1))
                 return response
         elif request.url.path == "/api/alerts/prometheus":
-            client_host = request.client.host if request.client else "unknown"
             try:
                 allowed, remaining, reset = await self.manager.rate_limiter.check(
                     f"prometheus-webhook:{client_host}"
@@ -354,6 +391,29 @@ class SecurityMiddleware(BaseHTTPMiddleware):
             if not allowed:
                 response = self._error(429, "Rate limit exceeded.", request_id)
                 response.headers["Retry-After"] = str(max(reset - int(time.time()), 1))
+                return response
+        elif request.url.path in {"/api/ready", "/metrics"}:
+            try:
+                allowed, remaining, reset = (
+                    await self.manager.preauth_rate_limiter.check(
+                        f"diagnostics:{client_host}"
+                    )
+                )
+            except Exception:
+                return self._error(
+                    503,
+                    "Distributed diagnostics limiter is unavailable.",
+                    request_id,
+                )
+            if not allowed:
+                response = self._error(
+                    429,
+                    "Diagnostics rate limit exceeded.",
+                    request_id,
+                )
+                response.headers["Retry-After"] = str(
+                    max(reset - int(time.time()), 1)
+                )
                 return response
         else:
             remaining = self.manager.settings.rate_limit_per_minute

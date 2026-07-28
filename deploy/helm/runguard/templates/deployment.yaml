@@ -16,10 +16,12 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "runguard.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
   template:
     metadata:
       labels:
         {{- include "runguard.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         {{- if not .Values.secrets.existingSecret }}
@@ -36,6 +38,7 @@ spec:
             matchLabels:
               app.kubernetes.io/name: {{ include "runguard.name" . }}
               app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: api
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -64,9 +67,17 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           readinessProbe:
-            httpGet:
-              path: /api/ready
-              port: http
+            exec:
+              command:
+                - python
+                - -c
+                - >-
+                  import os,urllib.request;
+                  request=urllib.request.Request(
+                  'http://127.0.0.1:8000/api/ready',
+                  headers={'X-RunGuard-Diagnostics-Token':
+                  os.environ['RUNGUARD_DIAGNOSTICS_TOKEN']});
+                  urllib.request.urlopen(request,timeout=4).read()
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

@@ -1,12 +1,12 @@
-FROM node:22-alpine AS web-builder
+FROM node:22-alpine@sha256:16e22a550f3863206a3f701448c45f7912c6896a62de43add43bb9c86130c3e2 AS web-builder
 WORKDIR /web
 COPY apps/web/package*.json ./
 RUN npm ci
 COPY apps/web ./
 RUN npm run build
 
-FROM python:3.12-slim
-COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /uvx /bin/
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+COPY --from=ghcr.io/astral-sh/uv:0.11.32@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594d5cd8de1a217f504c /uv /uvx /bin/
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

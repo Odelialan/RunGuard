@@ -950,6 +950,10 @@ kbd {
   color: var(--blue);
 }
 
+.status-shadowed {
+  color: var(--purple);
+}
+
 .status-resolved,
 .status-executed,
 .status-approved {

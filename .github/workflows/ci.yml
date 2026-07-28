@@ -1,6 +1,13 @@
 name: CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      run_external_model_evaluation:
+        description: Run the paid external-model evaluation after live fault recovery
+        required: true
+        default: false
+        type: boolean
   push:
     branches: [main]
     tags: ["v*"]
@@ -14,12 +21,12 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
         with:
-          version: "0.8.3"
+          version: "0.11.32"
           enable-cache: true
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22"
           cache: npm
@@ -55,33 +62,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - uses: azure/setup-helm@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4
         with:
-          version: v4.2.3
+          version: v4.2.0
       - name: Validate Compose and Helm
         run: |
           docker compose config --quiet
           helm lint deploy/helm/runguard \
             --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
             --set-string runnerImage.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string reviewerImage.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+            --set reviewer.enabled=true \
             --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
             --set-string secrets.openaiApiKey=ci-validation-only \
-            --set-string secrets.prometheusWebhookSecret=ci-webhook-secret \
-            --set-string secrets.langgraphAesKey=ci-key-16-bytes! \
-            --set-string auth.oidcIssuer=https://idp.example.com \
-            --set-string auth.oidcAudience=runguard \
-            --set-string auth.oidcJwksUrl=https://idp.example.com/.well-known/jwks.json \
-            --set-string config.targetInventory.order-api.environment=production \
-            --set-string config.targetInventory.order-api.namespace=runguard-system \
-            --set-string config.targetInventory.order-api.name=order-api
-          helm template runguard deploy/helm/runguard \
-            --namespace runguard-system \
-            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
-            --set-string runnerImage.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-            --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
-            --set-string secrets.openaiApiKey=ci-validation-only \
+            --set-string secrets.a2aReviewerToken=ci-reviewer-secret \
+            --set-string secrets.diagnosticsToken=ci-diagnostics-secret \
             --set-string secrets.prometheusWebhookSecret=ci-webhook-secret \
             --set-string secrets.langgraphAesKey=ci-key-16-bytes! \
             --set-string auth.oidcIssuer=https://idp.example.com \
@@ -90,18 +87,51 @@ jobs:
             --set-string config.targetInventory.order-api.environment=production \
             --set-string config.targetInventory.order-api.namespace=runguard-system \
             --set-string config.targetInventory.order-api.name=order-api \
+            --set-string config.targetInventory.order-api.canary_name=order-api-canary \
+            --set-string config.targetInventory.order-api.http_route_name=order-api \
+            --set-string config.targetInventory.order-api.stable_service=order-api \
+            --set-string config.targetInventory.order-api.canary_service=order-api-canary \
+            --set-string config.executionStrategy=canary
+          helm template runguard deploy/helm/runguard \
+            --namespace runguard-system \
+            --set-string image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+            --set-string runnerImage.digest=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+            --set-string reviewerImage.digest=sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc \
+            --set reviewer.enabled=true \
+            --set-string secrets.databaseUrl=postgresql://user:pass@postgres:5432/runguard \
+            --set-string secrets.openaiApiKey=ci-validation-only \
+            --set-string secrets.a2aReviewerToken=ci-reviewer-secret \
+            --set-string secrets.diagnosticsToken=ci-diagnostics-secret \
+            --set-string secrets.prometheusWebhookSecret=ci-webhook-secret \
+            --set-string secrets.langgraphAesKey=ci-key-16-bytes! \
+            --set-string auth.oidcIssuer=https://idp.example.com \
+            --set-string auth.oidcAudience=runguard \
+            --set-string auth.oidcJwksUrl=https://idp.example.com/.well-known/jwks.json \
+            --set-string config.targetInventory.order-api.environment=production \
+            --set-string config.targetInventory.order-api.namespace=runguard-system \
+            --set-string config.targetInventory.order-api.name=order-api \
+            --set-string config.targetInventory.order-api.canary_name=order-api-canary \
+            --set-string config.targetInventory.order-api.http_route_name=order-api \
+            --set-string config.targetInventory.order-api.stable_service=order-api \
+            --set-string config.targetInventory.order-api.canary_service=order-api-canary \
+            --set-string config.executionStrategy=canary \
             >/tmp/runguard-helm.yaml
           grep -q 'RUNGUARD_MAX_REQUEST_BODY_BYTES: "1048576"' /tmp/runguard-helm.yaml
+          grep -q 'RUNGUARD_A2A_REVIEWER_URL: "http://runguard-runguard-reviewer.runguard-system.svc/a2a/reviewer"' /tmp/runguard-helm.yaml
+          grep -q 'ghcr.io/odelialan/runguard-reviewer@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc' /tmp/runguard-helm.yaml
+          grep -A12 'resources:.*httproutes' /tmp/runguard-helm.yaml \
+            | grep -q -- '- "order-api"'
       - name: Test Rego with OPA
         run: |
           docker run --rm \
             -v "$PWD/policies:/policies:ro" \
-            openpolicyagent/opa:1.18.2-static \
+            openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da \
             test /policies -v
       - name: Build production images
         run: |
           docker build -f deploy/docker/api.Dockerfile -t runguard-api:ci .
           docker build -f deploy/docker/runner.Dockerfile -t runguard-runner:ci .
+          docker build -f deploy/docker/reviewer.Dockerfile -t runguard-reviewer:ci .
           docker build -f deploy/docker/web.Dockerfile -t runguard-web:ci .
           docker build -f deploy/docker/fault-injector.Dockerfile -t runguard-fault-injector:ci .
       - name: Start PostgreSQL, Redis and OPA
@@ -111,17 +141,40 @@ jobs:
             -e POSTGRES_DB=runguard \
             -e POSTGRES_USER=runguard \
             -e POSTGRES_PASSWORD=runguard-ci \
-            pgvector/pgvector:pg16
-          docker run -d --name redis --network runguard-ci redis:7.4-alpine
+            pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+          docker run -d --name redis --network runguard-ci \
+            redis:7.4-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
           docker run -d --name opa --network runguard-ci \
             -v "$PWD/policies:/policies:ro" \
-            openpolicyagent/opa:1.18.2-static \
+            openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da \
             run --server --addr=0.0.0.0:8181 /policies/runguard.rego
+          docker run -d --name reviewer --network runguard-ci -p 8001:8001 \
+            -e RUNGUARD_A2A_REVIEWER_TOKEN=ci-reviewer-secret \
+            runguard-reviewer:ci
           for attempt in $(seq 1 30); do
             docker exec postgres pg_isready -U runguard -d runguard && break
             sleep 2
           done
           docker exec redis redis-cli ping
+          for attempt in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:8001/health && break
+            sleep 1
+          done
+          test "$(curl -sS -o /dev/null -w '%{http_code}' \
+            -X POST http://127.0.0.1:8001/a2a/reviewer \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":"unauthorized","method":"message/send","params":{"message":{"messageId":"m0","role":"user","parts":[]}}}')" = 401
+          curl -fsS -X POST http://127.0.0.1:8001/a2a/reviewer \
+            -H 'Authorization: Bearer ci-reviewer-secret' \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":"ci-review","method":"message/send","params":{"message":{"messageId":"m1","role":"user","parts":[{"kind":"data","data":{"incident":{"environment":"production"},"investigation":{"evidence_ids":["EV-1"]},"evidence":[{"id":"EV-1"}],"remediation":{"tool_name":"kubernetes.patch_deployment","arguments":{"memory_limit":"1Gi"},"rollback":{"memory_limit":"256Mi"}}}}]}}}' \
+            >/tmp/reviewer.json
+          python - <<'PY'
+          import json
+          review = json.load(open("/tmp/reviewer.json"))
+          decision = review["result"]["artifacts"][0]["parts"][0]["data"]["decision"]
+          assert decision == "require_human_approval"
+          PY
       - name: Run production dependency integration
         run: |
           docker run -d --name runguard --network runguard-ci -p 8000:8000 \
@@ -143,6 +196,10 @@ jobs:
             -e RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND=postgres \
             -e 'LANGGRAPH_AES_KEY=ci-key-16-bytes!' \
             -e RUNGUARD_AUTO_RECOVER=true \
+            -e RUNGUARD_A2A_REVIEWER_URL=https://reviewer.example.com/a2a/reviewer \
+            -e RUNGUARD_A2A_REVIEWER_TOKEN=ci-reviewer-secret \
+            -e RUNGUARD_PROTECT_DIAGNOSTICS=true \
+            -e RUNGUARD_DIAGNOSTICS_TOKEN=ci-diagnostics-secret \
             -e OPENAI_API_KEY=ci-validation-only \
             -e RUNGUARD_AUTH_MODE=api_key \
             -e 'RUNGUARD_API_KEYS_JSON={"ci-token":{"subject":"ci","roles":["admin"]}}' \
@@ -152,9 +209,12 @@ jobs:
             -e RUNGUARD_CORS_ORIGINS=https://runguard.example.com \
             -e RUNGUARD_CORS_ORIGIN_REGEX= \
             -e RUNGUARD_PUBLIC_BASE_URL=https://runguard.example.com \
+            -e RUNGUARD_EGRESS_PROXY_URL=http://egress-gateway.invalid:8443 \
             runguard-api:ci
           for attempt in $(seq 1 40); do
-            if curl -fsS http://127.0.0.1:8000/api/ready >/tmp/ready.json; then
+            if curl -fsS http://127.0.0.1:8000/api/ready \
+              -H 'X-RunGuard-Diagnostics-Token: ci-diagnostics-secret' \
+              >/tmp/ready.json; then
               break
             fi
             sleep 2
@@ -192,10 +252,23 @@ jobs:
           print("Container integration passed")
           PY
           docker exec postgres psql -U runguard -d runguard -Atc \
-            "SELECT count(*) FROM schema_migrations" | grep -qx 4
+            "SELECT count(*) FROM schema_migrations" | grep -qx 6
           docker exec postgres psql -U runguard -d runguard -Atc \
             "SELECT to_regclass('public.workflow_checkpoints')" \
             | grep -qx workflow_checkpoints
+          EVENT_ID="$(docker exec postgres psql -U runguard -d runguard -Atc \
+            "SELECT id FROM incident_events ORDER BY occurred_at LIMIT 1")"
+          test -n "$EVENT_ID"
+          if docker exec postgres psql -v ON_ERROR_STOP=1 -U runguard -d runguard \
+            -c "UPDATE incident_events SET actor='tampered' WHERE id='$EVENT_ID'"; then
+            echo "append-only UPDATE unexpectedly succeeded" >&2
+            exit 1
+          fi
+          if docker exec postgres psql -v ON_ERROR_STOP=1 -U runguard -d runguard \
+            -c "DELETE FROM incident_events WHERE id='$EVENT_ID'"; then
+            echo "append-only DELETE unexpectedly succeeded" >&2
+            exit 1
+          fi
       - name: Print container logs on failure
         if: failure()
         run: |
@@ -203,3 +276,140 @@ jobs:
           docker logs postgres || true
           docker logs redis || true
           docker logs opa || true
+
+  live-kubernetes-12:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
+        with:
+          version: v0.32.0
+          cluster_name: runguard-eval
+          wait: 120s
+      - name: Inject and observe twelve Kubernetes failures
+        run: python3 scripts/kind-live-evaluation.py
+      - name: Preserve immutable experiment evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: live-kubernetes-12-${{ github.run_id }}
+          path: artifacts/live-kubernetes-12.json
+          if-no-files-found: error
+
+  external-model-evaluation:
+    if: github.event_name == 'workflow_dispatch' && inputs.run_external_model_evaluation
+    needs: [live-kubernetes-12]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+        with:
+          version: "0.11.32"
+          enable-cache: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: live-kubernetes-12-*
+          path: live-evidence
+          merge-multiple: true
+      - name: Run paid external model evaluation
+        env:
+          OPENAI_API_KEY: ${{ secrets.RUNGUARD_EVAL_OPENAI_API_KEY }}
+          RUNGUARD_LLM_MODEL: gpt-5-mini
+        run: |
+          test -n "$OPENAI_API_KEY"
+          uv sync --extra production
+          uv run python scripts/external-model-evaluation.py \
+            live-evidence/live-kubernetes-12.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: external-model-live-kubernetes-12-${{ github.run_id }}
+          path: artifacts/external-model-live-kubernetes-12.json
+          if-no-files-found: error
+
+  signed-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate, container-integration, live-kubernetes-12]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: runguard
+            dockerfile: deploy/docker/api.Dockerfile
+          - name: runguard-runner
+            dockerfile: deploy/docker/runner.Dockerfile
+          - name: runguard-reviewer
+            dockerfile: deploy/docker/reviewer.Dockerfile
+          - name: runguard-web
+            dockerfile: deploy/docker/web.Dockerfile
+          - name: runguard-fault-injector
+            dockerfile: deploy/docker/fault-injector.Dockerfile
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051
+        with:
+          images: ghcr.io/odelialan/${{ matrix.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+      - uses: sigstore/cosign-installer@d7543c93d881b35a8faa02e8e3605f69b7a1ce62
+      - name: Keyless sign and verify immutable image
+        env:
+          IMAGE: ghcr.io/odelialan/${{ matrix.name }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "$IMAGE@$DIGEST"
+          cosign verify "$IMAGE@$DIGEST" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp='^https://github.com/Odelialan/RunGuard/.github/workflows/ci.yml@refs/tags/v[0-9].*$'
+      - uses: anchore/sbom-action@43a17d6e7add2b5535efe4dcae9952337c479a93
+        with:
+          image: ghcr.io/odelialan/${{ matrix.name }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: ${{ matrix.name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-name: ghcr.io/odelialan/${{ matrix.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-name: ghcr.io/odelialan/${{ matrix.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: ${{ matrix.name }}.spdx.json
+          push-to-registry: true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ matrix.name }}-sbom
+          path: ${{ matrix.name }}.spdx.json
+          if-no-files-found: error

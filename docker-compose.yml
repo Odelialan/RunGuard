@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
     environment:
       POSTGRES_DB: runguard
       POSTGRES_USER: runguard
@@ -14,7 +14,7 @@ services:
       retries: 20
 
   redis:
-    image: redis:7.4-alpine
+    image: redis:7.4-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
     command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
     volumes:
       - redis-data:/data
@@ -25,7 +25,7 @@ services:
       retries: 20
 
   opa:
-    image: openpolicyagent/opa:1.18.2-static
+    image: openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da
     command:
       - run
       - --server
@@ -41,7 +41,7 @@ services:
       retries: 20
 
   prometheus:
-    image: prom/prometheus:v3.5.0
+    image: prom/prometheus:v3.5.0@sha256:63805ebb8d2b3920190daf1cb14a60871b16fd38bed42b857a3182bc621f4996
     command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
     volumes:
       - ./deploy/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
@@ -50,7 +50,7 @@ services:
       - "9090:9090"
 
   loki:
-    image: grafana/loki:3.5.3
+    image: grafana/loki:3.5.3@sha256:3165cecce301ce5b9b6e3530284b080934a05cd5cafac3d3d82edcb887b45ecd
     command: ["-config.file=/etc/loki/local-config.yaml"]
     volumes:
       - ./deploy/observability/loki.yml:/etc/loki/local-config.yaml:ro
@@ -59,7 +59,7 @@ services:
       - "3100:3100"
 
   tempo:
-    image: grafana/tempo:2.8.2
+    image: grafana/tempo:2.8.2@sha256:0ef775495967cd5d7a6b2e146b6ea695d624803c8db8349fb8ce4164f719f9b7
     command: ["-config.file=/etc/tempo/tempo.yml"]
     volumes:
       - ./deploy/observability/tempo.yml:/etc/tempo/tempo.yml:ro
@@ -68,7 +68,7 @@ services:
       - "3200:3200"
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.132.0
+    image: otel/opentelemetry-collector-contrib:0.132.0@sha256:e0f565815b2b8e78eb9fdbb80f6190c921ab323aaa8ccceab3255c6d4225f4af
     command: ["--config=/etc/otelcol/config.yml"]
     volumes:
       - ./deploy/observability/otel-collector.yml:/etc/otelcol/config.yml:ro
@@ -79,7 +79,7 @@ services:
       - "4318:4318"
 
   grafana:
-    image: grafana/grafana:12.1.1
+    image: grafana/grafana:12.1.1@sha256:a1701c2180249361737a99a01bc770db39381640e4d631825d38ff4535efa47d
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-runguard-local-only}
@@ -108,6 +108,8 @@ services:
       RUNGUARD_REDIS_URL: redis://redis:6379/0
       RUNGUARD_PUBLIC_BASE_URL: ${RUNGUARD_PUBLIC_BASE_URL:-}
       RUNGUARD_MAX_REQUEST_BODY_BYTES: ${RUNGUARD_MAX_REQUEST_BODY_BYTES:-1048576}
+      RUNGUARD_PROTECT_DIAGNOSTICS: ${RUNGUARD_PROTECT_DIAGNOSTICS:-false}
+      RUNGUARD_DIAGNOSTICS_TOKEN: ${RUNGUARD_DIAGNOSTICS_TOKEN:-local-diagnostics-token}
       RUNGUARD_POLICY_BACKEND: opa
       RUNGUARD_OPA_URL: http://opa:8181
       RUNGUARD_OPA_FAIL_CLOSED: "true"
@@ -123,6 +125,9 @@ services:
       RUNGUARD_MCP_GITHUB_TOKEN: ${RUNGUARD_MCP_GITHUB_TOKEN:-}
       RUNGUARD_AGENT_BACKEND: ${RUNGUARD_AGENT_BACKEND:-deterministic}
       RUNGUARD_EXECUTION_MODE: ${RUNGUARD_EXECUTION_MODE:-simulation}
+      RUNGUARD_EXECUTION_STRATEGY: ${RUNGUARD_EXECUTION_STRATEGY:-direct}
+      RUNGUARD_A2A_REVIEWER_URL: ${RUNGUARD_A2A_REVIEWER_URL:-http://reviewer:8001/a2a/reviewer}
+      RUNGUARD_A2A_REVIEWER_TOKEN: ${RUNGUARD_A2A_REVIEWER_TOKEN:-local-reviewer-token}
       RUNGUARD_PROMETHEUS_URL: http://prometheus:9090
       RUNGUARD_LOKI_URL: http://loki:3100
       RUNGUARD_GITHUB_REPOSITORY: ${RUNGUARD_GITHUB_REPOSITORY:-Odelialan/RunGuard}
@@ -142,6 +147,10 @@ services:
       LANGGRAPH_AES_KEY: ${LANGGRAPH_AES_KEY:-}
       RUNGUARD_AUTO_RECOVER: ${RUNGUARD_AUTO_RECOVER:-false}
       RUNGUARD_RECOVERY_CONCURRENCY: ${RUNGUARD_RECOVERY_CONCURRENCY:-4}
+      RUNGUARD_INCIDENT_TOOL_CALL_BUDGET: ${RUNGUARD_INCIDENT_TOOL_CALL_BUDGET:-24}
+      RUNGUARD_INCIDENT_TIMEOUT_SECONDS: ${RUNGUARD_INCIDENT_TIMEOUT_SECONDS:-900}
+      RUNGUARD_INCIDENT_TOKEN_BUDGET_PER_CALL: ${RUNGUARD_INCIDENT_TOKEN_BUDGET_PER_CALL:-4096}
+      RUNGUARD_INCIDENT_MEMORY_LIMIT: ${RUNGUARD_INCIDENT_MEMORY_LIMIT:-5}
     depends_on:
       postgres:
         condition: service_healthy
@@ -151,13 +160,34 @@ services:
         condition: service_healthy
       otel-collector:
         condition: service_started
+      reviewer:
+        condition: service_healthy
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready')",
+          "import os,urllib.request; request=urllib.request.Request('http://127.0.0.1:8000/api/ready',headers={'X-RunGuard-Diagnostics-Token':os.getenv('RUNGUARD_DIAGNOSTICS_TOKEN','')}); urllib.request.urlopen(request)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  reviewer:
+    build:
+      context: .
+      dockerfile: deploy/docker/reviewer.Dockerfile
+    environment:
+      RUNGUARD_A2A_REVIEWER_TOKEN: ${RUNGUARD_A2A_REVIEWER_TOKEN:-local-reviewer-token}
+      RUNGUARD_REVIEWER_PUBLIC_BASE_URL: ${RUNGUARD_REVIEWER_PUBLIC_BASE_URL:-http://localhost:8001}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health')",
         ]
       interval: 10s
       timeout: 5s

@@ -42,9 +42,21 @@ rules:
     resourceNames:
       {{- range $service, $target := . }}
       - {{ required (printf "config.targetInventory.%s.name is required" $service) $target.name | quote }}
+      {{- if $target.canary_name }}
+      - {{ $target.canary_name | quote }}
+      {{- end }}
       {{- end }}
     {{- end }}
     verbs: ["get", "patch", "update"]
+  {{- if eq .Values.config.executionStrategy "canary" }}
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["httproutes"]
+    resourceNames:
+      {{- range $service, $target := required "config.targetInventory is required for canary" .Values.config.targetInventory }}
+      - {{ required (printf "config.targetInventory.%s.http_route_name is required for canary" $service) $target.http_route_name | quote }}
+      {{- end }}
+    verbs: ["get", "patch", "update"]
+  {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

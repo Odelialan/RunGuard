@@ -10,6 +10,7 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "runguard.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
   policyTypes: ["Ingress", "Egress"]
   ingress:
     - from:
@@ -22,10 +23,36 @@ spec:
         - protocol: TCP
           port: 8000
   egress:
-    - ports:
-        - { protocol: TCP, port: 443 }
+    {{- if eq .Values.networkPolicy.externalHttps.mode "egressGateway" }}
     - to:
-        - namespaceSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ required "networkPolicy.externalHttps.gatewayNamespace is required" .Values.networkPolicy.externalHttps.gatewayNamespace | quote }}
+          podSelector:
+            matchLabels:
+              {{- toYaml (required "networkPolicy.externalHttps.gatewayPodLabels is required" .Values.networkPolicy.externalHttps.gatewayPodLabels) | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ required "networkPolicy.externalHttps.gatewayPort is required" .Values.networkPolicy.externalHttps.gatewayPort }}
+    {{- else }}
+      {{- fail "networkPolicy.externalHttps.mode must be egressGateway" }}
+    {{- end }}
+    {{- range required "networkPolicy.kubernetesApiCidrs must not be empty" .Values.networkPolicy.kubernetesApiCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
+        - { protocol: TCP, port: 443 }
+    {{- end }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace | quote }}
+        {{- range required "networkPolicy.dependencyNamespaces must not be empty" .Values.networkPolicy.dependencyNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
       ports:
         - { protocol: TCP, port: 5432 }
         - { protocol: TCP, port: 6379 }
@@ -33,6 +60,16 @@ spec:
         - { protocol: TCP, port: 9090 }
         - { protocol: TCP, port: 3100 }
         - { protocol: TCP, port: 4318 }
+    {{- if .Values.reviewer.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "runguard.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: reviewer
+      ports:
+        - { protocol: TCP, port: 8001 }
+    {{- end }}
     - to:
         - namespaceSelector:
             matchLabels:
@@ -53,8 +90,13 @@ spec:
       app.kubernetes.io/name: runguard-executor
   policyTypes: ["Egress"]
   egress:
-    - ports:
+    {{- range required "networkPolicy.kubernetesApiCidrs must not be empty" .Values.networkPolicy.kubernetesApiCidrs }}
+    - to:
+        - ipBlock:
+            cidr: {{ . | quote }}
+      ports:
         - { protocol: TCP, port: 443 }
+    {{- end }}
     - to:
         - namespaceSelector:
             matchLabels:
@@ -62,4 +104,37 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
+{{- if .Values.reviewer.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "runguard.fullname" . }}-reviewer
+  labels:
+    {{- include "runguard.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "runguard.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: reviewer
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "runguard.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: api
+      ports:
+        - { protocol: TCP, port: 8001 }
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+{{- end }}
 {{- end }}

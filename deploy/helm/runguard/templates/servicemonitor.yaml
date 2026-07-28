@@ -10,8 +10,16 @@ spec:
     matchLabels:
       app.kubernetes.io/name: {{ include "runguard.name" . }}
       app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: api
   endpoints:
     - port: http
       path: /metrics
       interval: {{ .Values.serviceMonitor.interval }}
+      {{- if .Values.config.protectDiagnostics }}
+      authorization:
+        type: Bearer
+        credentials:
+          name: {{ .Values.secrets.existingSecret | default (include "runguard.fullname" .) }}
+          key: RUNGUARD_DIAGNOSTICS_TOKEN
+      {{- end }}
 {{- end }}

@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from .a2a import reviewer_agent_card
+from .a2a import review_remediation_payload, reviewer_agent_card
 from .config import load_settings, validate_settings
 from .engine import IncidentEngine
 from .evaluation import run_baseline
@@ -82,7 +82,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="RunGuard API",
     description="Trusted Agentic SRE incident response API",
-    version="1.2.1",
+    version="1.4.0",
     lifespan=lifespan,
     docs_url=None if settings.enforce_production_guards else "/docs",
     redoc_url=None if settings.enforce_production_guards else "/redoc",
@@ -107,20 +107,7 @@ app.add_middleware(
 def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "version": "1.2.1",
-        "execution_mode": settings.execution_mode,
-        "connector_mode": settings.connector_mode,
-        "agent_backend": settings.agent_backend,
-        "policy_backend": settings.policy_backend,
-        "database": store.database_health(),
-        "database_backend": store.backend,
-        "database_pool": store.database_pool_stats(),
-        "redis_stream": "configured" if event_stream.enabled else "disabled",
-        "outbox_pending": store.outbox_pending_count(),
-        "opentelemetry": "configured" if telemetry.endpoint else "disabled",
-        "authentication": settings.auth_mode,
-        "workflow_checkpoints": settings.langgraph_checkpoint_backend,
-        "frontend": "ready" if web_index.is_file() else "not-built",
+        "version": "1.4.0",
     }
 
 
@@ -465,15 +452,15 @@ def policy_versions() -> list[dict[str, Any]]:
         {
             "version": settings.policy_version,
             "status": "active",
-            "rules": 5,
-            "published_at": "2026-07-24",
+            "rules": 8,
+            "published_at": "2026-07-28",
         }
     ]
 
 
 @app.post("/api/evals/run", status_code=201)
-def start_evaluation(payload: EvalRunRequest) -> dict[str, Any]:
-    return run_baseline(store, payload)
+async def start_evaluation(payload: EvalRunRequest) -> dict[str, Any]:
+    return await run_baseline(store, payload)
 
 
 @app.get("/api/evals")
@@ -530,27 +517,8 @@ def a2a_reviewer(request: Request, payload: A2ARequest) -> dict[str, Any]:
         (part.get("data") for part in parts if isinstance(part.get("data"), dict)),
         {},
     )
-    remediation = data.get("remediation", {})
-    incident = data.get("incident", {})
-    tool = remediation.get("tool_name", "unknown")
-    environment = incident.get("environment", "production")
-    rollback = remediation.get("rollback", {})
-    from .policy import classify_risk
-
-    risk = classify_risk(tool, environment, remediation.get("arguments", {}))
-    if str(risk) == "R3":
-        decision = "deny"
-        reason = "R3 or arbitrary execution is outside the reviewer permission boundary."
-    elif environment in {"production", "prod"}:
-        decision = "require_human_approval"
-        reason = "The plan is bounded, but production writes require a human approver."
-    elif not rollback:
-        decision = "deny"
-        reason = "The proposed write has no compensating action."
-    else:
-        decision = "approve"
-        reason = "The change is scoped, reversible, and remains behind the policy gateway."
-    review = {"decision": decision, "reason": reason, "concerns": []}
+    review = review_remediation_payload(data)
+    reason = review["reason"]
     task_id = f"a2a-review-{payload.id}"
     return {
         "jsonrpc": "2.0",

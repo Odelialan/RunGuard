@@ -31,7 +31,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: postgres
-          image: pgvector/pgvector:pg16
+          image: pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
           envFrom:
             - secretRef: { name: runguard-postgres }
           ports:
@@ -72,7 +72,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: redis
-          image: redis:7.4-alpine
+          image: redis:7.4-alpine@sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2
           args: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
           ports:
             - { name: redis, containerPort: 6379 }
@@ -114,7 +114,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: opa
-          image: openpolicyagent/opa:1.18.2-static
+          image: openpolicyagent/opa:1.18.2-static@sha256:57f7d06808fff6de3ea1d698e6430990973ca1370be0e54975f0083d615521da
           args: ["run", "--server", "--addr=0.0.0.0:8181", "/policies/runguard.rego"]
           ports:
             - { name: http, containerPort: 8181 }

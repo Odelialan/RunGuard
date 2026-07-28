@@ -291,6 +291,21 @@ class Store:
             if self.backend == "postgresql":
                 connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
             connection.executescript(schema)
+            if self.backend == "sqlite":
+                connection.executescript(
+                    """
+                    CREATE TRIGGER IF NOT EXISTS incident_events_append_only_update
+                    BEFORE UPDATE ON incident_events
+                    BEGIN
+                        SELECT RAISE(ABORT, 'incident_events is append-only');
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS incident_events_append_only_delete
+                    BEFORE DELETE ON incident_events
+                    BEGIN
+                        SELECT RAISE(ABORT, 'incident_events is append-only');
+                    END;
+                    """
+                )
             if self.backend == "postgresql":
                 connection.execute(
                     f"ALTER TABLE evidence ADD COLUMN IF NOT EXISTS "
@@ -1366,6 +1381,7 @@ class Store:
         duration_ms: int,
         *,
         succeeded: bool,
+        execution_status: str | None = None,
     ) -> dict[str, Any]:
         with self._lock, self.connect() as connection:
             intent = connection.execute(
@@ -1404,7 +1420,10 @@ class Store:
                     utc_now(),
                 ),
             )
-            if succeeded:
+            final_status = execution_status or (
+                "EXECUTED" if succeeded else "EXECUTION_FAILED"
+            )
+            if succeeded and final_status == "EXECUTED":
                 raw_arguments = intent["arguments"]
                 arguments = (
                     json.loads(raw_arguments)
@@ -1434,8 +1453,8 @@ class Store:
                 )
             else:
                 connection.execute(
-                    "UPDATE tool_intents SET status = 'EXECUTION_FAILED' WHERE id = ?",
-                    (intent_id,),
+                    "UPDATE tool_intents SET status = ? WHERE id = ?",
+                    (final_status, intent_id),
                 )
             row = connection.execute(
                 "SELECT * FROM execution_results WHERE id = ?", (execution_id,)
@@ -1515,6 +1534,136 @@ class Store:
                 (embedding, embedding, limit),
             ).fetchall()
         return [self._decode(row, "metadata") for row in rows]
+
+    def semantic_incident_memory(
+        self,
+        embedding: list[float],
+        service: str,
+        exclude_incident_id: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        if self.backend != "postgresql":
+            return []
+        with self.connect() as connection:
+            from pgvector.psycopg import register_vector
+
+            register_vector(connection.raw)
+            rows = connection.execute(
+                """
+                SELECT i.id AS incident_id, i.service, i.title, i.updated_at,
+                       COALESCE(
+                           (
+                               SELECT h.cause FROM hypotheses h
+                               WHERE h.incident_id = i.id
+                               ORDER BY h.confidence DESC LIMIT 1
+                           ),
+                           ''
+                       ) AS root_cause,
+                       COALESCE(
+                           (
+                               SELECT ie.payload FROM incident_events ie
+                               WHERE ie.incident_id = i.id
+                                 AND ie.event_type = 'incident.status_changed'
+                               ORDER BY ie.sequence DESC LIMIT 1
+                           ),
+                           '{}'
+                       ) AS resolution_payload,
+                       MAX(1 - (e.embedding <=> ?)) AS similarity
+                FROM incidents i
+                JOIN evidence e ON e.incident_id = i.id
+                WHERE e.embedding IS NOT NULL
+                  AND i.service = ?
+                  AND i.id <> ?
+                  AND i.status IN ('RESOLVED', 'ROLLED_BACK')
+                GROUP BY i.id, i.service, i.title, i.updated_at
+                ORDER BY MAX(e.embedding <=> ?)
+                LIMIT ?
+                """,
+                (
+                    embedding,
+                    service,
+                    exclude_incident_id,
+                    embedding,
+                    max(1, min(limit, 10)),
+                ),
+            ).fetchall()
+        memories: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._row(row)
+            raw_resolution = item.pop("resolution_payload", "{}")
+            try:
+                resolution = (
+                    json.loads(raw_resolution)
+                    if isinstance(raw_resolution, str)
+                    else dict(raw_resolution or {})
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                resolution = {}
+            item["resolution"] = str(
+                resolution.get("reason")
+                or resolution.get("verification")
+                or resolution.get("rollback")
+                or "completed"
+            )
+            memories.append(item)
+        return memories
+
+    def incident_memory(
+        self,
+        service: str,
+        exclude_incident_id: str,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT i.id AS incident_id, i.service, i.title, i.updated_at,
+                       COALESCE(
+                           (
+                               SELECT h.cause FROM hypotheses h
+                               WHERE h.incident_id = i.id
+                               ORDER BY h.confidence DESC LIMIT 1
+                           ),
+                           ''
+                       ) AS root_cause,
+                       COALESCE(
+                           (
+                               SELECT ie.payload FROM incident_events ie
+                               WHERE ie.incident_id = i.id
+                                 AND ie.event_type = 'incident.status_changed'
+                               ORDER BY ie.sequence DESC LIMIT 1
+                           ),
+                           '{}'
+                       ) AS resolution_payload
+                FROM incidents i
+                WHERE i.service = ?
+                  AND i.id <> ?
+                  AND i.status IN ('RESOLVED', 'ROLLED_BACK')
+                ORDER BY i.updated_at DESC
+                LIMIT ?
+                """,
+                (service, exclude_incident_id, max(1, min(limit, 10))),
+            ).fetchall()
+        memories: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._row(row)
+            raw_resolution = item.pop("resolution_payload", "{}")
+            try:
+                resolution = (
+                    json.loads(raw_resolution)
+                    if isinstance(raw_resolution, str)
+                    else dict(raw_resolution or {})
+                )
+            except (json.JSONDecodeError, TypeError, ValueError):
+                resolution = {}
+            item["resolution"] = str(
+                resolution.get("reason")
+                or resolution.get("verification")
+                or resolution.get("rollback")
+                or "completed"
+            )
+            memories.append(item)
+        return memories
 
     def upsert_postmortem(self, incident_id: str, document: dict[str, Any]) -> dict[str, Any]:
         postmortem_id = document.get("id") or f"PM-{uuid4().hex[:8].upper()}"

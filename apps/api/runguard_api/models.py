@@ -20,6 +20,7 @@ class IncidentStatus(StrEnum):
     ROLLING_BACK = "ROLLING_BACK"
     ROLLED_BACK = "ROLLED_BACK"
     HUMAN_HANDOFF = "HUMAN_HANDOFF"
+    SHADOWED = "SHADOWED"
     CANCELLED = "CANCELLED"
 
 
@@ -112,7 +113,7 @@ class PolicySimulationRequest(BaseModel):
 class EvalRunRequest(BaseModel):
     suite: Literal["baseline-12"] = "baseline-12"
     model: str = "deterministic-demo"
-    prompt_version: str = "1.2.1"
+    prompt_version: str = "1.4.0"
 
 
 class PostmortemActionItem(BaseModel):

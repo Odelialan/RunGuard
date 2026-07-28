@@ -180,6 +180,13 @@ class PolicyEvaluator:
             result = body.get("result")
             if not isinstance(result, dict):
                 return self._unavailable(risk, "OPA returned an undefined policy decision.")
+            if result.get("decision") not in {"allow", "require_approval", "deny"}:
+                return self._unavailable(risk, "OPA returned an invalid policy decision.")
+            if not all(
+                isinstance(result.get(field), str) and result[field].strip()
+                for field in ("matched_policy", "reason")
+            ):
+                return self._unavailable(risk, "OPA returned incomplete policy metadata.")
             return {
                 "decision": result["decision"],
                 "risk_level": risk,

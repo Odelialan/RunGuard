@@ -19,6 +19,7 @@ config:
   connectorMode: hybrid
   agentBackend: deterministic
   executionMode: kubernetes_job
+  executionStrategy: direct
   policyBackend: opa
   opaUrl: http://opa.runguard-system.svc:8181
   prometheusUrl: ""
@@ -46,6 +47,7 @@ config:
   corsOriginRegex: ""
   publicBaseUrl: http://127.0.0.1:8088
   maxRequestBodyBytes: 1048576
+  protectDiagnostics: false
 
 auth:
   mode: disabled

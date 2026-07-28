@@ -707,6 +707,7 @@ def test_complete_production_guard_configuration_is_accepted(
         cors_origins=("https://runguard.example.com",),
         cors_origin_regex="",
         public_base_url="https://runguard.example.com",
+        egress_proxy_url="http://egress-gateway.egress-system.svc:8443",
         policy_backend="opa",
         opa_url="http://opa:8181",
         connector_mode="production",
@@ -725,6 +726,10 @@ def test_complete_production_guard_configuration_is_accepted(
         langgraph_checkpoint_backend="postgres",
         langgraph_checkpoint_encryption_key="0123456789abcdef",
         auto_recover=True,
+        a2a_reviewer_url="https://reviewer.example.com/a2a/reviewer",
+        a2a_reviewer_token="reviewer-secret",
+        protect_diagnostics=True,
+        diagnostics_token="diagnostics-secret",
         target_inventory_json=(
             '{"order-api":{"environment":"production",'
             '"namespace":"runguard-system","name":"order-api"}}'

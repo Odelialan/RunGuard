@@ -8,6 +8,7 @@ ALLOWED_TOOLS = {
     "kubernetes.patch_deployment",
     "kubernetes.scale_deployment",
     "kubernetes.rollout_restart",
+    "kubernetes.set_http_route_weights",
 }
 
 ALLOWED_ARGUMENTS = {
@@ -39,6 +40,15 @@ ALLOWED_ARGUMENTS = {
         "expected_resource_version",
         "idempotency_key",
     },
+    "kubernetes.set_http_route_weights": {
+        "environment",
+        "namespace",
+        "route_name",
+        "stable_service",
+        "canary_service",
+        "canary_weight",
+        "idempotency_key",
+    },
 }
 
 LAST_EXECUTION_ANNOTATION = "runguard.io/last-execution"
@@ -60,11 +70,75 @@ def _replayed_before(annotations: dict[str, str], idempotency_key: str) -> dict[
     return before
 
 
-def _load_kubernetes() -> tuple[Any, Any]:
+def _load_kubernetes() -> tuple[Any, Any, Any]:
     from kubernetes import client, config
 
     config.load_incluster_config()
-    return client, client.AppsV1Api()
+    return client, client.AppsV1Api(), client.CustomObjectsApi()
+
+
+def _set_http_route_weights(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    namespace = arguments["namespace"]
+    route_name = arguments["route_name"]
+    stable_service = arguments["stable_service"]
+    canary_service = arguments["canary_service"]
+    canary_weight = int(arguments["canary_weight"])
+    if not 0 <= canary_weight <= 100:
+        raise ValueError("Canary traffic weight must be between 0 and 100.")
+    route = api.get_namespaced_custom_object(
+        "gateway.networking.k8s.io",
+        "v1",
+        namespace,
+        "httproutes",
+        route_name,
+    )
+    metadata = route.get("metadata", {})
+    annotations = dict(metadata.get("annotations") or {})
+    rules = route.get("spec", {}).get("rules")
+    if not isinstance(rules, list) or not rules:
+        raise ValueError(f"HTTPRoute {route_name!r} has no routing rules.")
+    before: dict[str, int] = {}
+    found = set()
+    for rule in rules:
+        for backend in rule.get("backendRefs", []):
+            name = backend.get("name")
+            if name in {stable_service, canary_service}:
+                found.add(name)
+                before[name] = int(backend.get("weight", 1))
+                backend["weight"] = (
+                    canary_weight if name == canary_service else 100 - canary_weight
+                )
+    if found != {stable_service, canary_service}:
+        raise ValueError(
+            "HTTPRoute must contain both the inventory-bound stable and canary Services."
+        )
+    patch = {
+        "metadata": {
+            "resourceVersion": metadata.get("resourceVersion"),
+            "annotations": {
+                **annotations,
+                LAST_EXECUTION_ANNOTATION: arguments["idempotency_key"],
+                LAST_BEFORE_ANNOTATION: json.dumps(before, separators=(",", ":")),
+            },
+        },
+        "spec": {"rules": rules},
+    }
+    updated = api.patch_namespaced_custom_object(
+        "gateway.networking.k8s.io",
+        "v1",
+        namespace,
+        "httproutes",
+        route_name,
+        patch,
+    )
+    return {
+        "before": before,
+        "after": {
+            stable_service: 100 - canary_weight,
+            canary_service: canary_weight,
+        },
+        "resource_version": updated.get("metadata", {}).get("resourceVersion"),
+    }
 
 
 def _patch_deployment(api: Any, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -225,7 +299,7 @@ def run() -> int:
     if tool not in ALLOWED_TOOLS:
         print(json.dumps({"ok": False, "error": f"Tool {tool!r} is not allowed."}))
         return 2
-    _, api = _load_kubernetes()
+    _, api, custom_api = _load_kubernetes()
     arguments = dict(payload["arguments"])
     unexpected = set(arguments) - ALLOWED_ARGUMENTS[tool]
     if unexpected:
@@ -262,6 +336,10 @@ def run() -> int:
         "kubernetes.patch_deployment": _patch_deployment,
         "kubernetes.scale_deployment": _scale_deployment,
         "kubernetes.rollout_restart": _restart_deployment,
+        "kubernetes.set_http_route_weights": lambda _, args: _set_http_route_weights(
+            custom_api,
+            args,
+        ),
     }
     result = handlers[tool](api, arguments)
     print(json.dumps({"ok": True, "tool": tool, **result}, separators=(",", ":")))

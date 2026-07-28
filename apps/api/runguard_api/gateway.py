@@ -193,6 +193,28 @@ class MockMCPTransport:
                 f"k8s://simulation/deployment/{service}/restart",
                 500,
             )
+        if tool_name == "kubernetes.set_http_route_weights":
+            weight = int(arguments["canary_weight"])
+            return ToolResult(
+                True,
+                {
+                    "mode": "simulation",
+                    "runner_result": {
+                        "ok": True,
+                        "before": {
+                            arguments["stable_service"]: 100,
+                            arguments["canary_service"]: 0,
+                        },
+                        "after": {
+                            arguments["stable_service"]: 100 - weight,
+                            arguments["canary_service"]: weight,
+                        },
+                        "resource_version": f"sim-route-{weight}",
+                    },
+                },
+                f"k8s://simulation/httproute/{arguments['route_name']}",
+                100,
+            )
         return ToolResult(
             False,
             {"error": f"Tool {tool_name!r} is not registered."},
@@ -204,8 +226,21 @@ class MockMCPTransport:
 class RecordedMCPTransport(MockMCPTransport):
     """Replay transport: responses are supplied by a previously recorded run."""
 
-    def __init__(self, recording: dict[str, ToolResult] | None = None) -> None:
-        self.recording = recording or {}
+    def __init__(
+        self,
+        recording: dict[str, ToolResult | list[ToolResult]] | None = None,
+        *,
+        strict: bool = False,
+        expected_calls: list[tuple[str, dict[str, Any]]] | None = None,
+    ) -> None:
+        self.recording = {
+            name: list(results) if isinstance(results, list) else [results]
+            for name, results in (recording or {}).items()
+        }
+        self.strict = strict
+        self._positions: dict[str, int] = {}
+        self._expected_calls = expected_calls or []
+        self._call_position = 0
 
     async def call_tool(
         self,
@@ -213,8 +248,38 @@ class RecordedMCPTransport(MockMCPTransport):
         arguments: dict[str, Any],
         context: ToolContext,
     ) -> ToolResult:
-        if tool_name in self.recording:
-            return self.recording[tool_name]
+        if self._expected_calls:
+            if self._call_position >= len(self._expected_calls):
+                return ToolResult(
+                    False,
+                    {"error": "Recorded trajectory received an unexpected extra tool call."},
+                    "recorded://unexpected-call",
+                    0,
+                )
+            expected_tool, expected_arguments = self._expected_calls[self._call_position]
+            if tool_name != expected_tool or arguments != expected_arguments:
+                return ToolResult(
+                    False,
+                    {
+                        "error": "Recorded trajectory tool name or arguments did not match.",
+                        "expected_tool": expected_tool,
+                    },
+                    "recorded://trajectory-mismatch",
+                    0,
+                )
+            self._call_position += 1
+        position = self._positions.get(tool_name, 0)
+        results = self.recording.get(tool_name, [])
+        if position < len(results):
+            self._positions[tool_name] = position + 1
+            return results[position]
+        if self.strict:
+            return ToolResult(
+                False,
+                {"error": f"No recorded response remains for {tool_name!r}."},
+                "recorded://missing",
+                0,
+            )
         return await super().call_tool(tool_name, arguments, context)
 
 
@@ -272,6 +337,7 @@ class ProductionMCPTransport:
                 "kubernetes.patch_deployment",
                 "kubernetes.scale_deployment",
                 "kubernetes.rollout_restart",
+                "kubernetes.set_http_route_weights",
             }:
                 if self.settings.execution_mode != "kubernetes_job":
                     return ToolResult(

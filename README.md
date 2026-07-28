@@ -2,17 +2,17 @@
 
 > Agentic SRE 事故响应与可信执行平台
 
-[![Version](https://img.shields.io/badge/version-1.2.1-6ef0b5)](./VERSION)
+[![Version](https://img.shields.io/badge/version-1.4.0-6ef0b5)](./VERSION)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-78aef7)](./pyproject.toml)
 [![React](https://img.shields.io/badge/React-TypeScript-78aef7)](./apps/web/package.json)
 [![License](https://img.shields.io/badge/license-Apache--2.0-ac92ff)](./LICENSE)
 
 RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行、效果验证和复盘记录连接为一条可审计的事故响应链路。LLM 只生成结构化 Tool Intent，无法直接获得基础设施凭据；所有写操作必须经过参数校验、风险分级、策略判断、幂等控制与回滚检查。
 
-当前版本：**1.2.1** · 发布日期：**2026-07-26**
+当前版本：**1.4.0** · 发布日期：**2026-07-28**
 作者：**OdeliaLan**
 
-## 1.2 能力
+## 1.4 能力
 
 - Prometheus Webhook 与人工 Incident 接入
 - Commander、Investigator、Remediation、Reviewer、Reporter 五类 Agent 工作流
@@ -20,6 +20,8 @@ RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行�
 - Prometheus、Loki、Kubernetes、GitHub 真实连接器与 Mock/Hybrid/Recorded 模式
 - 官方 MCP Streamable HTTP 客户端，可连接四类独立远程 MCP Server
 - 每条根因假设关联来源 URI 与 Evidence ID
+- Evidence Security Gateway 按工具白名单裁剪、递归脱敏并检测提示注入
+- Agent 与 A2A 仅接收最小化、带信任分类的证据和历史事故记忆视图
 - 独立 OPA 服务执行 Rego 策略，OPA 异常时 fail-closed
 - 生产写操作人工审批，R3 操作默认拒绝
 - PostgreSQL + pgvector 证据存储、语义检索与 Redis Streams 事件总线
@@ -32,10 +34,14 @@ RunGuard 将告警、Agent 调查、风险策略、人工审批、受控执行�
 - 生产验证同时检查 P95、错误率与 Deployment 就绪副本
 - OpenTelemetry OTLP Trace，可接 Tempo/Jaeger 与 Grafana
 - append-only Incident Event 事件记录
-- Recorded MCP Transport 抽象；当前 Replay API 仅生成无副作用的审计摘要
-- A2A 1.0 Reviewer Agent Card、JSON-RPC 审查服务与远程 Reviewer Client
+- Recorded MCP Transport 会重放只读工具响应并校验已记录的结构化模型产物
+- A2A 1.0 Reviewer Agent Card、远程 Client 与独立 Reviewer 部署单元
+- Direct、Shadow 与基于 Gateway API HTTPRoute 的 5%/25%/50% Canary 流量执行策略
+- 每次 Incident 的工具调用、累计模型 Token、单次模型输出与活动时间预算
+- kind 中可重复执行的 12 类真实 Kubernetes 故障注入、观测和恢复实验
+- Release 镜像 digest 固定、SPDX SBOM、GitHub OIDC provenance、Cosign keyless 签名及 Kyverno 准入策略
 - 结构化 Postmortem 页面、JSON/Markdown 导出与行动项
-- 12 个固定故障案例及可复现评测报告
+- 12 个实际执行策略、证据安全与 Recorded Replay 代码的契约评测
 - Helm Chart、kind 三节点演示集群与可控故障注入/补偿验证脚本
 - 中英文切换、提升字号后的响应式运维工作台
 - API Key/OIDC 身份认证、viewer/operator/approver/service/admin RBAC
@@ -130,7 +136,7 @@ hostname -I
 4. 审核证据、变更差异、策略原因、回滚参数和幂等键后批准或拒绝。
 5. 批准后进入模拟沙箱执行并自动验证 P95、错误率和工作负载稳定性。
 6. 在 Trace Explorer 查看 Agent、检索、工具、策略、审批、执行和验证 Span。
-7. 在 Evaluations 运行 `baseline-12`，生成带范围声明的静态参考报告。
+7. 在 Evaluations 运行 `baseline-12`，生成带范围声明和原始案例结果的实测契约报告。
 
 ## 系统架构
 
@@ -143,7 +149,8 @@ flowchart LR
     C --> F["Remediation"]
     C --> G["Reviewer"]
     C --> V["Reporter"]
-    E --> H["MCP Tool Gateway"]
+    E --> W["Evidence Security Gateway"]
+    W --> H["MCP Tool Gateway"]
     F --> I["Normalized Tool Intent"]
     I --> J["Risk Classifier"]
     J --> K["Policy Gateway"]
@@ -154,9 +161,9 @@ flowchart LR
     L --> O["Verification"]
     O -->|"pass"| P["Resolved"]
     O -->|"fail"| Q["Compensation / Rollback"]
-    C -.-> R[("PostgreSQL + pgvector")]
+    C -.-> R[("PostgreSQL + pgvector + Incident Memory")]
     H -.-> S["Prometheus / Loki / K8s / GitHub"]
-    C -.-> T["Redis Streams + Replay + Eval"]
+    C -.-> T["Redis Streams + Recorded Replay + Contract Eval"]
     C -.-> U["OTLP → Tempo / Jaeger / Grafana"]
 ```
 
@@ -229,7 +236,7 @@ stateDiagram-v2
 
 ## 策略决策
 
-| 风险 | 示例 | 1.1 默认策略 |
+| 风险 | 示例 | 1.3 默认策略 |
 | --- | --- | --- |
 | R0 | 查询指标、日志、Pod 状态 | 自动允许 |
 | R1 | staging Deployment 可逆修改 | 自动允许 |
@@ -252,10 +259,21 @@ Python 求值器；生产设置 `RUNGUARD_POLICY_BACKEND=opa` 后，独立 OPA D
 | `RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND` | `postgres` | 持久化 Graph 节点状态 |
 | `RUNGUARD_POLICY_BACKEND` | `opa` | 使用独立 OPA |
 | `RUNGUARD_EXECUTION_MODE` | `kubernetes_job` | 使用受限 Job 执行 |
+| `RUNGUARD_EXECUTION_STRATEGY` | `direct`、`shadow` 或 `canary` | 控制零副作用或渐进执行策略 |
 | `RUNGUARD_TARGET_INVENTORY_JSON` | 服务到环境/Namespace/资源名的映射 | 服务端绑定真实执行目标，拒绝客户端或 Agent 改写环境 |
 | `RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT` | Collector HTTP 端点 | 输出 OTLP Trace |
-| `RUNGUARD_A2A_REVIEWER_URL` | A2A JSON-RPC URL | 委托独立 Reviewer |
+| `RUNGUARD_A2A_REVIEWER_URL` | HTTPS 或集群内 `.svc` A2A URL | 委托独立 Reviewer |
+| `RUNGUARD_A2A_REVIEWER_TOKEN` | 独立随机 Bearer Token | 认证 API 到 Reviewer 的服务调用 |
 | `RUNGUARD_AUTH_MODE` | `oidc` 或 `api_key` | 启用身份认证与 RBAC |
+| `RUNGUARD_PREAUTH_RATE_LIMIT_PER_MINUTE` | `30` | 在 OIDC/JWKS 验证前限制来源请求 |
+| `RUNGUARD_PROTECT_DIAGNOSTICS` | `true` | 保护 Readiness 与 Metrics |
+| `RUNGUARD_DIAGNOSTICS_TOKEN` | 独立随机 Token | Kubernetes Probe 与 Prometheus 专用 |
+| `RUNGUARD_INCIDENT_TOOL_CALL_BUDGET` | `24` | 限制单次事故自动工具调用 |
+| `RUNGUARD_INCIDENT_TIMEOUT_SECONDS` | `900` | 限制单段自动处理活动时间 |
+| `RUNGUARD_INCIDENT_TOKEN_BUDGET_PER_CALL` | `4096` | 限制每个结构化模型节点输出 |
+| `RUNGUARD_INCIDENT_TOKEN_BUDGET_TOTAL` | `100000` | 约束整次 Incident 的累计模型用量；缺少供应商 usage 时采用保守本地上界 |
+| `RUNGUARD_CANARY_TRAFFIC_STEPS` | `5,25,50` | Gateway API HTTPRoute 渐进流量权重 |
+| `RUNGUARD_EGRESS_PROXY_URL` | 集群内 egress gateway | 外部 HTTPS 仅允许通过受控代理 |
 | `RUNGUARD_PUBLIC_BASE_URL` | `https://runguard.example.com` | 固定 Agent Card 公网地址，避免信任请求 Host |
 | `RUNGUARD_MAX_REQUEST_BODY_BYTES` | `1048576` | 限制写请求体，包含无 Content-Length 的流式请求 |
 | `RUNGUARD_ENFORCE_PRODUCTION_GUARDS` | `true` | 启动时强制校验生产安全基线 |
@@ -268,12 +286,16 @@ Python 求值器；生产设置 `RUNGUARD_POLICY_BACKEND=opa` 后，独立 OPA D
   "order-api": {
     "environment": "production",
     "namespace": "runguard-system",
-    "name": "order-api"
+    "name": "order-api",
+    "canary_name": "order-api-canary",
+    "http_route_name": "order-api",
+    "stable_service": "order-api",
+    "canary_service": "order-api-canary"
   }
 }
 ```
 
-Helm 生产安装还要求 `image.digest` 与 `runnerImage.digest`，执行控制面和 Runner
+Helm 生产安装还要求 API、Runner 与 Reviewer 镜像 digest，执行控制面和 Runner
 均以不可变镜像摘要部署。事件中提交的 `environment` 必须与目标清单一致。
 手工部署时，`RUNGUARD_KUBERNETES_RUNNER_IMAGE` 同样必须使用
 `repository@sha256:<64位摘要>` 格式。
@@ -305,7 +327,26 @@ Prometheus Webhook 请求必须携带 Unix 秒时间戳 `X-RunGuard-Timestamp` �
 11. 日志平台不可用
 12. 多个候选根因并存
 
-Dashboard 展示 Top-1/Top-3 根因期望、策略期望、危险操作拦截、Trace 覆盖、重复副作用、工具调用次数与处理耗时。当前 `baseline-12` 是**静态确定性参考夹具**，不执行真实模型、故障注入、Worker 中断或 Kubernetes 变更，不能作为实测成果。
+Dashboard 展示实际执行得到的根因规则契约、策略决策、危险操作拦截、证据安全、Recorded Replay、工具调用次数与处理耗时。默认 `baseline-12` 会执行当前 Python 策略、字段白名单、秘密脱敏、提示注入检测和严格 Recorded Transport；它不执行外部模型或真实 Kubernetes 故障，因此只代表代码契约，不代表生产 SRE 效果。Top-1/Top-3 RCA 等模型质量指标在该模式下明确返回不可用，不再把固定规则命中率展示为模型准确率。
+
+CI 的 `live-kubernetes-12` Job 会在临时 kind 集群创建并观察 12 类真实故障，
+逐项执行恢复并上传不可变 JSON 证据。付费外部模型评测必须通过
+`workflow_dispatch` 显式启用，并提供独立的 `RUNGUARD_EVAL_OPENAI_API_KEY` Secret；
+它消费真实实验产物并计算 Top-1/Top-3，而不会把未执行的结果写成成绩。
+
+## PRD 验收状态
+
+| 范围 | 当前结论 |
+| --- | --- |
+| P0 事故闭环 | 告警/人工接入、工作台、Agent 编排、工具网关、证据引用、OPA、审批、检查点、幂等执行、验证、补偿、Trace 与 Postmortem 已形成可执行闭环。 |
+| P0 数据可靠性 | PostgreSQL/pgvector、Redis Streams、事务 Outbox、分布式锁和数据库级 append-only Incident Event 已实现；生产模式会拒绝 SQLite、内存检查点和无 Redis 配置。 |
+| P0 评测 | 保留 12 项代码契约；新增 kind 中 12 类真实 Kubernetes 故障注入、观测和逐项恢复，CI 上传实验 JSON。外部模型评测已形成显式付费工作流，只有实际执行后才产出 Top-1/Top-3。 |
+| P1 Reviewer | 可独立部署并通过 A2A 调用，检查精确工具白名单、证据引用、参数和有效补偿；OPA 仍是最终授权点。 |
+| P1 Replay | Recorded 模型节点及读写工具轨迹按顺序和参数重放，禁止真实模型/工具调用，报告副作用固定为 0。 |
+| P1 Shadow/Canary | Shadow 为零写入；Canary 先变更独立 Deployment，再通过 inventory 绑定的 Gateway API HTTPRoute 执行 5%/25%/50% 流量和逐级 SLO 验证，失败立即归零并补偿。 |
+| P1 Memory | 仅从同服务且已 `RESOLVED/ROLLED_BACK` 的事故中检索；进入 Agent 前再次脱敏、注入检测和隔离。 |
+| P1 版本与预算 | Run 关联 Prompt、Graph、Policy 与模型配置；工具、活动时间、单次输出和累计模型 Token 均受限。供应商缺少 usage 时使用 UTF-8 字节与协议余量形成保守上界，不再记为零。 |
+| 部署验收 | Helm 可 lint/render；Dockerfile、Compose 和 kind 第三方镜像固定 digest。Tag 构建生成 SPDX SBOM、provenance、Cosign 签名并由 Kyverno 策略在准入阶段校验。 |
 
 ## 仓库结构
 
@@ -337,6 +378,41 @@ RunGuard/
 ```
 
 该脚本会检查 Python 静态规则、前端类型与生产构建、API smoke test、Git 追踪文件大小和常见凭据模式。
+
+## 1.4.0 发布记录
+
+**2026-07-28 · Measurable production assurance**
+
+- 新增 `live-kubernetes-12`：在临时 kind 集群注入并观察 OOM、CrashLoop、
+  ImagePull、不可用副本、CPU Throttle、连接池耗尽、Redis 延迟、错误环境变量、
+  Selector 错误、发布回归、日志平台不可用和复合故障，并逐项执行恢复。
+- 新增显式付费外部模型评测入口；只有具备独立评测 API Key 并实际运行时才生成
+  Top-1/Top-3 成绩。
+- Canary 通过 inventory 绑定的 Gateway API HTTPRoute 逐级切换
+  5%/25%/50% 流量，每级重新验证；任何失败都会先将流量归零再执行工作负载补偿。
+- 模型调用增加 Incident 累计 Token 硬预算；provider usage 缺失或偏低时使用本地
+  保守上界记账并 fail-closed。
+- PostgreSQL append-only 约束由静默忽略升级为数据库异常拒绝；CI 对 UPDATE 与
+  DELETE 执行真实破坏性断言。
+- 删除任意目的地 443 网络规则，外部 HTTPS 仅允许到标签绑定的 egress gateway，
+  Kubernetes API 仅允许配置的 CIDR。
+- 所有 Dockerfile 基础阶段、Compose 和 kind 第三方镜像固定 SHA-256 digest；
+  tag 发布生成多架构镜像、SPDX SBOM、provenance 和 Cosign keyless 签名。
+- 新增 Kyverno `verifyImages` 准入策略，并将 GitHub Actions 固定到不可变 commit SHA。
+
+## 1.3.0 发布记录
+
+**2026-07-28 · Trust boundary completion**
+
+- 新增 Evidence Security Gateway：工具级字段白名单、秘密脱敏、长度限制、注入检测和双层 Agent 数据隔离。
+- 命中提示注入指标的 Incident、Evidence 或 Memory 文本不再进入模型正文，而以隔离占位符替代；原始审计记录留在存储层供人工检查。
+- 历史同服务 Incident Memory 自动进入调查上下文；启用 pgvector 时优先使用语义检索。
+- Replay API 按原顺序和参数严格重放已记录的读写工具结果，并重新执行 Recorded 模型节点数据流；整个过程不调用外部工具或模型且副作用为零，缺少完整轨迹的旧 Run 明确返回 `UNREPLAYABLE`。
+- `baseline-12` 改为实际运行策略、证据安全与 Recorded Replay 契约并记录实测耗时；固定规则命中率不再冒充 Top-1/Top-3 模型质量。
+- OIDC/API Key 验证前增加按来源限流；生产 Readiness 与 Metrics 需要独立诊断令牌，Liveness 改为无依赖轻量检查。
+- 增加可单独构建和部署、无数据库及集群凭据的 A2A Reviewer 服务。
+- 增加 Shadow 零副作用路径、绑定 `canary_name` 的 Canary 先行执行/验证/失败补偿，以及 Incident 工具调用、活动时间和单次模型输出上限。
+- OPA 非法决策、OIDC 对称算法和跨 Namespace 宽泛依赖访问改为 fail-closed；Incident Event 在数据库层拒绝更新与删除。
 
 ## 1.2.1 发布记录
 
@@ -401,11 +477,18 @@ RunGuard/
 - Helm 默认采用单集群、Namespace 级最小权限；企业 SSO、多租户和多集群调度需要按组织
   IAM 与网络边界单独集成。
 - 未配置生产依赖时，系统明确显示 Mock/Simulation，不会把模拟数据标记成生产结果。
-- `baseline-12` 尚未驱动真实故障注入或模型推理；当前分数仅是参考夹具，不是实验数据。
-- Replay API 尚未重新执行 Recorded 模型/工具轨迹，只返回已有 Run 的无副作用审计摘要。
-- A2A Reviewer 可调用外部服务，但仓库未提供独立 Reviewer 部署单元。
-- Shadow Mode、Canary Execution、每次 Incident 的 Token/工具/时间预算尚未实现。
-- 语义 Evidence Search 已提供 API，但历史 Incident Memory 尚未自动进入调查决策。
+- `baseline-12` 仍只是实测代码契约，不能作为线上效果指标；真实故障结果来自
+  `live-kubernetes-12`，外部模型结果来自显式启动的独立工作流。
+- v1.3.0 之前没有完整 recording 的 Run 会返回 `UNREPLAYABLE`，不会伪装成确定性重放。
+- 生产模式必须配置外部 A2A Reviewer；仓库同时保留嵌入式 Reviewer 供本地开发。
+- Canary 需要集群安装 Gateway API，并在目标清单绑定 HTTPRoute、稳定 Service 和
+  Canary Service；不满足绑定时启动校验或执行会 fail-closed。
+- 模型累计用量是安全预算而非账单：供应商 usage 与保守本地上界取较大值，因此可能
+  高估，但不会因供应商不返回 usage 而失去上限。
+- 生产集群必须提供 egress gateway、正确的 Kubernetes API CIDR，并安装 Kyverno
+  才能执行签名准入；Chart 不负责部署这些集群级基础设施。
+- 当前工作站没有 Docker，因此本地无法复现 kind/多架构构建；这些验收由 GitHub
+  Hosted Runner 执行，仓库不会把“工作流已实现”表述为“某次远端运行已通过”。
 
 ## License
 

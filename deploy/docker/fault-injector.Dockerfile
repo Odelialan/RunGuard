@@ -1,13 +1,12 @@
-FROM python:3.12-slim
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+COPY --from=ghcr.io/astral-sh/uv:0.11.32@sha256:df4cae8f3a96d175e2e5f992e597550000edbe78fdc2594d5cd8de1a217f504c /uv /bin/uv
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
-RUN pip install --no-cache-dir \
-    "fastapi>=0.116,<1" \
-    "prometheus-client>=0.22,<1" \
-    "uvicorn[standard]>=0.35,<1"
+COPY services/fault-injector/requirements.lock /app/requirements.lock
+RUN uv pip install --system --require-hashes -r /app/requirements.lock
 COPY services/fault-injector/app.py /app/app.py
 
 RUN useradd --create-home --uid 10001 fault-injector

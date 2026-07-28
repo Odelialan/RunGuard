@@ -12,10 +12,20 @@ import httpx
 from .config import Settings, parse_target_inventory
 from .embeddings import EvidenceIndexer
 from .event_stream import EventStream, LockLeaseLost, LockUnavailable
-from .gateway import ToolContext, build_transport
+from .evidence_security import sanitize_source_uri, sanitize_tool_payload
+from .gateway import RecordedMCPTransport, ToolContext, ToolResult, build_transport
 from .models import IncidentStatus, PolicySimulationRequest
-from .orchestration import LangGraphOrchestrator
-from .policy import PolicyEvaluator, classify_risk, has_effective_rollback
+from .orchestration import (
+    LangGraphOrchestrator,
+    replay_recorded_model_trajectory,
+)
+from .policy import (
+    READ_TOOLS,
+    WRITE_TOOLS,
+    PolicyEvaluator,
+    classify_risk,
+    has_effective_rollback,
+)
 from .postmortem import PostmortemService
 from .store import Store
 
@@ -24,6 +34,10 @@ R = TypeVar("R")
 
 
 class WorkflowLocked(ValueError):
+    pass
+
+
+class IncidentBudgetExceeded(RuntimeError):
     pass
 
 
@@ -50,6 +64,7 @@ class IncidentEngine:
         )
         self._locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._recovery_task: asyncio.Task[None] | None = None
+        self._tool_usage: dict[str, int] = {}
         self.target_inventory = parse_target_inventory(settings.target_inventory_json)
 
     async def _db(
@@ -60,6 +75,93 @@ class IncidentEngine:
         **kwargs: P.kwargs,
     ) -> R:
         return await asyncio.to_thread(method, *args, **kwargs)
+
+    async def _consume_tool_call(self, run_id: str) -> int:
+        used = self._tool_usage.get(run_id)
+        if used is None:
+            try:
+                original = await self._db(self.store.get_run, run_id)
+            except KeyError:
+                used = 0
+            else:
+                used = sum(
+                    1
+                    for event in original.get("events", [])
+                    if event.get("span_type")
+                    in {
+                        "retrieval",
+                        "tool",
+                        "tool_execution",
+                        "verification",
+                        "compensation",
+                    }
+                )
+        if used >= self.settings.incident_tool_call_budget:
+            raise IncidentBudgetExceeded(
+                f"tool-call limit {self.settings.incident_tool_call_budget} reached"
+            )
+        used += 1
+        self._set_tool_usage(run_id, used)
+        return used
+
+    def _set_tool_usage(self, run_id: str, used: int) -> None:
+        if run_id not in self._tool_usage and len(self._tool_usage) >= 4096:
+            self._tool_usage.pop(next(iter(self._tool_usage)))
+        self._tool_usage[run_id] = used
+
+    def _token_usage_for(self, run_id: str) -> int:
+        if not self.orchestrator:
+            return 0
+        usage_reader = getattr(self.orchestrator, "token_usage", None)
+        return int(usage_reader(run_id)) if callable(usage_reader) else 0
+
+    async def _call_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        context: ToolContext,
+    ) -> ToolResult:
+        ordinal = await self._consume_tool_call(context.run_id)
+        result = await self.transport.call_tool(tool_name, arguments, context)
+        if tool_name in READ_TOOLS | WRITE_TOOLS:
+            try:
+                await self._db(self.store.get_run, context.run_id)
+            except KeyError:
+                return result
+            sanitized = sanitize_tool_payload(tool_name, result.data)
+            recorded_arguments = {
+                key: value
+                for key, value in arguments.items()
+                if key
+                in {
+                    "service",
+                    "environment",
+                    "namespace",
+                    "name",
+                    "query",
+                    "minutes",
+                    "container",
+                    "memory_limit",
+                    "cpu_limit",
+                    "replicas",
+                    "expected_resource_version",
+                }
+            }
+            await self._checkpoint(
+                context.run_id,
+                context.incident_id,
+                f"RECORDED_TOOL_CALL_{ordinal:03d}",
+                {
+                    "tool_name": tool_name,
+                    "arguments": recorded_arguments,
+                    "result": sanitized.data,
+                    "source_uri": sanitize_source_uri(result.source_uri),
+                    "duration_ms": result.duration_ms,
+                    "ok": result.ok,
+                    "side_effects": 0,
+                },
+            )
+        return result
 
     async def connect(self) -> None:
         if self.orchestrator:
@@ -121,12 +223,52 @@ class IncidentEngine:
             return await self.event_stream.run_with_lock(
                 f"incident:{incident_id}",
                 1800,
-                lambda: self._start_unlocked(incident_id),
+                lambda: self._bounded(self._start_unlocked(incident_id)),
             )
         except (LockUnavailable, LockLeaseLost) as exc:
             raise WorkflowLocked(
                 "Incident workflow lock is unavailable or its lease was lost."
             ) from exc
+        except (IncidentBudgetExceeded, TimeoutError) as exc:
+            return await self._budget_handoff(incident_id, str(exc))
+
+    async def _bounded(self, operation):
+        async with asyncio.timeout(self.settings.incident_timeout_seconds):
+            return await operation
+
+    async def _budget_handoff(
+        self,
+        incident_id: str,
+        reason: str,
+    ) -> dict[str, Any]:
+        incident = await self._db(self.store.get_incident, incident_id)
+        run_id = incident.get("current_run_id")
+        if run_id:
+            await self._db(
+                self.store.add_trace,
+                run_id,
+                incident_id,
+                "budget",
+                "incident.budget_exhausted",
+                "orchestrator",
+                "ERROR",
+                0,
+                {"reason": reason},
+            )
+            await self._db(
+                self.store.finish_run,
+                run_id,
+                "HUMAN_HANDOFF",
+                self._token_usage_for(run_id),
+                self._tool_usage.get(run_id, 0),
+            )
+        return await self._db(
+            self.store.update_status,
+            incident_id,
+            IncidentStatus.HUMAN_HANDOFF,
+            "budget-controller",
+            {"reason": f"Incident automation stopped by its budget: {reason}"},
+        )
 
     async def _start_unlocked(self, incident_id: str) -> dict[str, Any]:
         lock = self._locks.setdefault(incident_id, asyncio.Lock())
@@ -141,7 +283,7 @@ class IncidentEngine:
                 incident_id,
                 self.settings.prompt_version,
                 graph_version=(
-                    "incident-response-langgraph-v1.2"
+                    "incident-response-langgraph-v1.4"
                     if self.orchestrator
                     else "incident-response-v1"
                 ),
@@ -152,6 +294,7 @@ class IncidentEngine:
                     "model": self.settings.llm_model if self.orchestrator else "demo-v1",
                 },
             )
+            self._set_tool_usage(run_id, 0)
             await self._checkpoint(run_id, incident_id, "RUN_CREATED")
             await self._transition(
                 incident_id,
@@ -183,7 +326,13 @@ class IncidentEngine:
                 if item.get("metadata", {}).get("ok") is True
             }
             if len(successful_sources) < 2 or "kubernetes" not in successful_sources:
-                await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 4)
+                await self._db(
+                    self.store.finish_run,
+                    run_id,
+                    "HUMAN_HANDOFF",
+                    self._token_usage_for(run_id),
+                    self._tool_usage.get(run_id, 0),
+                )
                 return await self._db(
                     self.store.update_status,
                     incident_id,
@@ -206,6 +355,8 @@ class IncidentEngine:
             if self.orchestrator:
                 try:
                     enriched = await self._db(self.store.get_incident, incident_id)
+                    incident_memory = await self._load_incident_memory(enriched)
+                    enriched["incident_memory"] = incident_memory
                     graph_output = await self.orchestrator.run(
                         enriched,
                         enriched["evidence"],
@@ -215,7 +366,12 @@ class IncidentEngine:
                         run_id,
                         incident_id,
                         "LANGGRAPH_COMPLETED",
-                        await self.orchestrator.checkpoint(run_id) or {},
+                        {
+                            "graph_checkpoint": (
+                                await self.orchestrator.checkpoint(run_id) or {}
+                            ),
+                            "output": graph_output,
+                        },
                     )
                 except Exception as exc:
                     await self._db(
@@ -230,7 +386,11 @@ class IncidentEngine:
                         {"error": str(exc)},
                     )
                     await self._db(
-                        self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 4
+                        self.store.finish_run,
+                        run_id,
+                        "HUMAN_HANDOFF",
+                        self._token_usage_for(run_id),
+                        self._tool_usage.get(run_id, 0),
                     )
                     return await self._db(
                         self.store.update_status,
@@ -245,7 +405,13 @@ class IncidentEngine:
             linked_evidence = investigation.get("evidence_ids") or evidence_ids
             invalid_evidence = set(linked_evidence) - set(evidence_ids)
             if invalid_evidence:
-                await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 4)
+                await self._db(
+                    self.store.finish_run,
+                    run_id,
+                    "HUMAN_HANDOFF",
+                    self._token_usage_for(run_id),
+                    self._tool_usage.get(run_id, 0),
+                )
                 return await self._db(
                     self.store.update_status,
                     incident_id,
@@ -319,7 +485,13 @@ class IncidentEngine:
                     0,
                     {"error": str(exc)},
                 )
-                await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 4)
+                await self._db(
+                    self.store.finish_run,
+                    run_id,
+                    "HUMAN_HANDOFF",
+                    self._token_usage_for(run_id),
+                    self._tool_usage.get(run_id, 0),
+                )
                 return await self._db(
                     self.store.update_status,
                     incident_id,
@@ -429,7 +601,13 @@ class IncidentEngine:
             )
 
             if decision["decision"] == "deny":
-                await self._db(self.store.finish_run, run_id, "DENIED", 2860, 4)
+                await self._db(
+                    self.store.finish_run,
+                    run_id,
+                    "DENIED",
+                    self._token_usage_for(run_id),
+                    self._tool_usage.get(run_id, 0),
+                )
                 await self._checkpoint(run_id, incident_id, "DENIED")
                 return await self._db(
                     self.store.update_status,
@@ -451,7 +629,11 @@ class IncidentEngine:
                     {"tool_intent_id": intent["id"]},
                 )
                 await self._db(
-                    self.store.finish_run, run_id, "WAITING_APPROVAL", 2860, 4
+                    self.store.finish_run,
+                    run_id,
+                    "WAITING_APPROVAL",
+                    self._token_usage_for(run_id),
+                    self._tool_usage.get(run_id, 0),
                 )
                 await self._checkpoint(
                     run_id,
@@ -484,12 +666,14 @@ class IncidentEngine:
                 return await self.event_stream.run_with_lock(
                     resource_lock_key,
                     600,
-                    lambda: self._execute_unlocked(intent_id),
+                    lambda: self._bounded(self._execute_unlocked(intent_id)),
                 )
             except (LockUnavailable, LockLeaseLost) as exc:
                 raise WorkflowLocked(
                     "Target resource lock is unavailable or its lease was lost."
                 ) from exc
+            except (IncidentBudgetExceeded, TimeoutError) as exc:
+                return await self._budget_handoff(intent["incident_id"], str(exc))
 
     async def _execute_unlocked(self, intent_id: str) -> dict[str, Any]:
         intent = await self._db(self.store.get_intent, intent_id)
@@ -498,7 +682,11 @@ class IncidentEngine:
             return await self._verify_and_finalize(intent, incident)
         if intent["status"] == "EXECUTION_FAILED":
             await self._db(
-                self.store.finish_run, intent["run_id"], "HUMAN_HANDOFF", 0, 5
+                self.store.finish_run,
+                intent["run_id"],
+                "HUMAN_HANDOFF",
+                self._token_usage_for(intent["run_id"]),
+                self._tool_usage.get(intent["run_id"], 0),
             )
             return await self._db(
                 self.store.update_status,
@@ -528,7 +716,76 @@ class IncidentEngine:
             actor=intent["agent_name"],
             idempotency_key=intent["idempotency_key"],
         )
-        result = await self.transport.call_tool(
+        if self.settings.execution_strategy == "shadow":
+            await self._db(
+                self.store.record_execution,
+                intent_id,
+                {
+                    "mode": "shadow",
+                    "side_effects": 0,
+                    "proposed_arguments": intent["arguments"],
+                    "rollback_validated": self._has_effective_rollback(
+                        intent["rollback"]
+                    ),
+                },
+                intent["rollback"],
+                intent["arguments"],
+                0,
+                succeeded=True,
+                execution_status="SHADOWED",
+            )
+            await self._db(
+                self.store.add_trace,
+                run_id,
+                incident["id"],
+                "tool_execution",
+                f"{intent['tool_name']}.shadow",
+                "tool-gateway",
+                "OK",
+                0,
+                {"mode": "shadow", "side_effects": 0},
+            )
+            await self._db(
+                self.store.finish_run,
+                run_id,
+                "SHADOWED",
+                self._token_usage_for(run_id),
+                self._tool_usage.get(run_id, 0),
+            )
+            await self._checkpoint(
+                run_id,
+                incident["id"],
+                "SHADOW_COMPLETED",
+                {"tool_intent_id": intent_id, "side_effects": 0},
+            )
+            return await self._db(
+                self.store.update_status,
+                incident["id"],
+                IncidentStatus.SHADOWED,
+                "shadow-controller",
+                {
+                    "reason": "Shadow evaluation completed without infrastructure writes.",
+                    "tool_intent_id": intent_id,
+                },
+            )
+        if self.settings.execution_strategy == "canary":
+            canary_passed = await self._run_canary(intent, incident, context)
+            if not canary_passed:
+                await self._db(
+                    self.store.finish_run,
+                    run_id,
+                    "HUMAN_HANDOFF",
+                    self._token_usage_for(run_id),
+                    self._tool_usage.get(run_id, 0),
+                )
+                return await self._db(
+                    self.store.update_status,
+                    incident["id"],
+                    IncidentStatus.HUMAN_HANDOFF,
+                    "canary-controller",
+                    {"reason": "Canary execution or verification failed closed."},
+                )
+        result = await self._call_tool(
             intent["tool_name"],
             intent["arguments"],
             context,
@@ -578,7 +835,13 @@ class IncidentEngine:
             {"mode": self.settings.execution_mode, "idempotency_key": intent["idempotency_key"]},
         )
         if not result.ok:
-            await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 5)
+            await self._db(
+                self.store.finish_run,
+                run_id,
+                "HUMAN_HANDOFF",
+                self._token_usage_for(run_id),
+                self._tool_usage.get(run_id, 0),
+            )
             await self._checkpoint(
                 run_id,
                 incident["id"],
@@ -605,6 +868,213 @@ class IncidentEngine:
             return updated
         latest_intent = await self._db(self.store.get_intent, intent_id)
         return await self._verify_and_finalize(latest_intent, incident)
+
+    async def _run_canary(
+        self,
+        intent: dict[str, Any],
+        incident: dict[str, Any],
+        context: ToolContext,
+    ) -> bool:
+        target = self.target_inventory.get(incident["service"], {})
+        canary_name = target.get("canary_name")
+        traffic_fields = {
+            "http_route_name",
+            "stable_service",
+            "canary_service",
+        }
+        if (
+            not canary_name
+            or not traffic_fields.issubset(target)
+            or intent["tool_name"]
+            not in {
+            "kubernetes.patch_deployment",
+            "kubernetes.scale_deployment",
+            }
+        ):
+            await self._db(
+                self.store.add_trace,
+                intent["run_id"],
+                incident["id"],
+                "canary",
+                "canary.target_binding",
+                "canary-controller",
+                "ERROR",
+                0,
+                {
+                    "reason": (
+                        "Canary requires a bound Deployment, HTTPRoute, stable Service, "
+                        "canary Service, and a state-restoring patch or scale tool."
+                    )
+                },
+            )
+            return False
+        canary_arguments = {**intent["arguments"], "name": canary_name}
+        canary_context = ToolContext(
+            incident_id=context.incident_id,
+            run_id=context.run_id,
+            actor="canary-controller",
+            idempotency_key=f"{context.idempotency_key}-canary",
+        )
+        result = await self._call_tool(
+            intent["tool_name"],
+            canary_arguments,
+            canary_context,
+        )
+        await self._db(
+            self.store.add_trace,
+            intent["run_id"],
+            incident["id"],
+            "canary",
+            f"{intent['tool_name']}.canary",
+            "canary-controller",
+            "OK" if result.ok else "ERROR",
+            result.duration_ms,
+            {
+                "canary_name": canary_name,
+                "source_uri": result.source_uri,
+                "idempotency_key": canary_context.idempotency_key,
+            },
+        )
+        if not result.ok:
+            return False
+        verification = await self._verify(
+            incident,
+            intent["run_id"],
+            target_override={**target, "name": canary_name},
+        )
+        traffic_results: list[dict[str, Any]] = []
+        if verification["passed"]:
+            for weight in (*self.settings.canary_traffic_steps, 0):
+                traffic_context = ToolContext(
+                    incident_id=context.incident_id,
+                    run_id=context.run_id,
+                    actor="canary-controller",
+                    idempotency_key=(
+                        f"{context.idempotency_key}-traffic-{weight}"
+                    ),
+                )
+                traffic_arguments = {
+                    "environment": incident["environment"],
+                    "namespace": target["namespace"],
+                    "route_name": target["http_route_name"],
+                    "stable_service": target["stable_service"],
+                    "canary_service": target["canary_service"],
+                    "canary_weight": weight,
+                }
+                await self._consume_tool_call(intent["run_id"])
+                traffic_result = await self.transport.call_tool(
+                    "kubernetes.set_http_route_weights",
+                    traffic_arguments,
+                    traffic_context,
+                )
+                step_verification = (
+                    await self._verify(incident, intent["run_id"])
+                    if traffic_result.ok and weight > 0
+                    else {"passed": traffic_result.ok}
+                )
+                step_passed = bool(
+                    traffic_result.ok and step_verification.get("passed")
+                )
+                traffic_results.append(
+                    {
+                        "canary_weight": weight,
+                        "passed": step_passed,
+                        "source_uri": traffic_result.source_uri,
+                    }
+                )
+                await self._db(
+                    self.store.add_trace,
+                    intent["run_id"],
+                    incident["id"],
+                    "canary",
+                    "gateway.httproute.weight",
+                    "canary-controller",
+                    "OK" if step_passed else "ERROR",
+                    traffic_result.duration_ms,
+                    traffic_results[-1],
+                )
+                if not step_passed:
+                    verification["passed"] = False
+                    if weight != 0:
+                        reset_context = ToolContext(
+                            incident_id=context.incident_id,
+                            run_id=context.run_id,
+                            actor="canary-controller",
+                            idempotency_key=(
+                                f"{context.idempotency_key}-traffic-emergency-reset"
+                            ),
+                        )
+                        await self._consume_tool_call(intent["run_id"])
+                        await self.transport.call_tool(
+                            "kubernetes.set_http_route_weights",
+                            {**traffic_arguments, "canary_weight": 0},
+                            reset_context,
+                        )
+                    break
+        await self._checkpoint(
+            intent["run_id"],
+            incident["id"],
+            "CANARY_VERIFIED",
+            {
+                "canary_name": canary_name,
+                "passed": verification["passed"],
+                "verification": verification,
+                "traffic_steps": traffic_results,
+            },
+        )
+        runner_result = (
+            result.data.get("runner_result", {})
+            if isinstance(result.data, dict)
+            else {}
+        )
+        before = (
+            runner_result.get("before", {})
+            if isinstance(runner_result.get("before"), dict)
+            else {}
+        )
+        before = dict(before)
+        if runner_result.get("resource_version"):
+            before["expected_resource_version"] = str(
+                runner_result["resource_version"]
+            )
+        rollback_arguments = {
+            key: value
+            for key, value in canary_arguments.items()
+            if key in {"service", "environment", "namespace", "name", "container"}
+        }
+        rollback_arguments.update(before)
+        rollback_context = ToolContext(
+            incident_id=context.incident_id,
+            run_id=context.run_id,
+            actor="canary-controller",
+            idempotency_key=f"{context.idempotency_key}-canary-rollback",
+        )
+        await self._consume_tool_call(intent["run_id"])
+        rollback_method = getattr(self.transport, "rollback", None)
+        if rollback_method:
+            rollback_result = await rollback_method(
+                intent["tool_name"],
+                rollback_arguments,
+                rollback_context,
+            )
+        else:
+            rollback_result = await self.transport.call_tool(
+                intent["tool_name"],
+                rollback_arguments,
+                rollback_context,
+            )
+        await self._db(
+            self.store.add_trace,
+            intent["run_id"],
+            incident["id"],
+            "compensation",
+            f"{intent['tool_name']}.canary_rollback",
+            "canary-controller",
+            "OK" if rollback_result.ok else "ERROR",
+            rollback_result.duration_ms,
+            {"canary_name": canary_name},
+        )
+        return bool(verification["passed"] and rollback_result.ok)
 
     async def _verify_and_finalize(
         self,
@@ -639,7 +1109,13 @@ class IncidentEngine:
         if not verification["passed"]:
             latest_intent = await self._db(self.store.get_intent, intent["id"])
             if not self._has_effective_rollback(latest_intent["rollback"]):
-                await self._db(self.store.finish_run, run_id, "HUMAN_HANDOFF", 0, 6)
+                await self._db(
+                    self.store.finish_run,
+                    run_id,
+                    "HUMAN_HANDOFF",
+                    self._token_usage_for(run_id),
+                    self._tool_usage.get(run_id, 0),
+                )
                 await self._checkpoint(
                     run_id,
                     incident["id"],
@@ -664,7 +1140,13 @@ class IncidentEngine:
                 intent["id"],
                 "Post-change SLO verification failed.",
             )
-        await self._db(self.store.finish_run, run_id, "RESOLVED", 3298, 6)
+        await self._db(
+            self.store.finish_run,
+            run_id,
+            "RESOLVED",
+            self._token_usage_for(run_id),
+            self._tool_usage.get(run_id, 0),
+        )
         resolved = await self._db(
             self.store.update_status,
             incident["id"],
@@ -843,6 +1325,7 @@ class IncidentEngine:
             idempotency_key=f"{intent['idempotency_key']}-rollback",
         )
         rollback_method = getattr(self.transport, "rollback", None)
+        await self._consume_tool_call(run_id)
         if rollback_method:
             result = await rollback_method(intent["tool_name"], intent["rollback"], context)
         else:
@@ -877,8 +1360,8 @@ class IncidentEngine:
             self.store.finish_run,
             run_id,
             "ROLLED_BACK" if result.ok else "HUMAN_HANDOFF",
-            3298,
-            7,
+            self._token_usage_for(run_id),
+            self._tool_usage.get(run_id, 0),
         )
         updated = await self._db(
             self.store.update_status,
@@ -906,12 +1389,14 @@ class IncidentEngine:
             return await self.event_stream.run_with_lock(
                 f"incident:{incident_id}",
                 1800,
-                lambda: self._resume_unlocked(incident_id),
+                lambda: self._bounded(self._resume_unlocked(incident_id)),
             )
         except (LockUnavailable, LockLeaseLost) as exc:
             raise WorkflowLocked(
                 "Incident recovery lock is unavailable or its lease was lost."
             ) from exc
+        except (IncidentBudgetExceeded, TimeoutError) as exc:
+            return await self._budget_handoff(incident_id, str(exc))
 
     async def _resume_unlocked(self, incident_id: str) -> dict[str, Any]:
         lock = self._locks.setdefault(incident_id, asyncio.Lock())
@@ -936,9 +1421,21 @@ class IncidentEngine:
                     return await self.execute(intent["id"])
                 if status == "ROLLING_BACK" and intent:
                     return await self.rollback(intent["id"], "Resumed interrupted rollback.")
-                if status in {"RESOLVED", "DENIED", "ROLLED_BACK", "CANCELLED"}:
+                if status in {
+                    "RESOLVED",
+                    "DENIED",
+                    "ROLLED_BACK",
+                    "SHADOWED",
+                    "CANCELLED",
+                }:
                     return incident
-                await self._db(self.store.finish_run, run_id, "SUPERSEDED", 0, 0)
+                await self._db(
+                    self.store.finish_run,
+                    run_id,
+                    "SUPERSEDED",
+                    self._token_usage_for(run_id),
+                    self._tool_usage.get(run_id, 0),
+                )
                 await self._checkpoint(
                     run_id,
                     incident_id,
@@ -960,14 +1457,156 @@ class IncidentEngine:
         if not run_id:
             raise ValueError("No run is available to replay.")
         original = await self._db(self.store.get_run, run_id)
+        recordings: dict[str, list[ToolResult]] = {}
+        calls: list[dict[str, Any]] = []
+        recorded_checkpoints = sorted(
+            (
+                checkpoint
+                for checkpoint in original.get("checkpoints", [])
+                if str(checkpoint.get("phase", "")).startswith(
+                    "RECORDED_TOOL_CALL_"
+                )
+            ),
+            key=lambda checkpoint: str(checkpoint.get("phase", "")),
+        )
+        for checkpoint in recorded_checkpoints:
+            recording = checkpoint.get("state", {})
+            if not isinstance(recording, dict):
+                continue
+            tool_name = str(recording.get("tool_name", ""))
+            result_data = recording.get("result", {})
+            if not tool_name or not isinstance(result_data, dict):
+                continue
+            recorded_result = ToolResult(
+                ok=bool(recording.get("ok")),
+                data=result_data,
+                source_uri=str(recording.get("source_uri", "recorded://unknown")),
+                duration_ms=int(recording.get("duration_ms", 0)),
+            )
+            recordings.setdefault(tool_name, []).append(recorded_result)
+            calls.append(
+                {
+                    "tool_name": tool_name,
+                    "arguments": (
+                        recording.get("arguments", {})
+                        if isinstance(recording.get("arguments"), dict)
+                        else {}
+                    ),
+                    "expected": recorded_result,
+                }
+            )
+        seen_tools: set[str] = set()
+        for evidence in reversed(incident.get("evidence", [])) if not calls else []:
+            metadata = evidence.get("metadata", {})
+            recording = (
+                metadata.get("recording", {}) if isinstance(metadata, dict) else {}
+            )
+            tool_name = str(recording.get("tool_name", ""))
+            if not tool_name or tool_name in seen_tools:
+                continue
+            seen_tools.add(tool_name)
+            result_data = recording.get("result", {})
+            if not isinstance(result_data, dict):
+                continue
+            recorded_result = ToolResult(
+                ok=bool(recording.get("ok")),
+                data=result_data,
+                source_uri=str(recording.get("source_uri", "recorded://unknown")),
+                duration_ms=int(recording.get("duration_ms", 0)),
+            )
+            recordings.setdefault(tool_name, []).append(recorded_result)
+            calls.append(
+                {
+                    "tool_name": tool_name,
+                    "arguments": (
+                        recording.get("arguments", {})
+                        if isinstance(recording.get("arguments"), dict)
+                        else {}
+                    ),
+                    "expected": recorded_result,
+                }
+            )
+
+        replay_transport = RecordedMCPTransport(
+            recordings,
+            strict=True,
+            expected_calls=[
+                (str(call["tool_name"]), dict(call["arguments"]))
+                for call in calls
+            ],
+        )
+        tool_results: list[dict[str, Any]] = []
+        for index, call in enumerate(calls):
+            expected = call["expected"]
+            actual = await replay_transport.call_tool(
+                call["tool_name"],
+                call["arguments"],
+                ToolContext(
+                    incident_id=incident_id,
+                    run_id=f"{run_id}-replay",
+                    actor="replay-controller",
+                    idempotency_key=f"{run_id.lower()}-replay-{index}",
+                ),
+            )
+            matched = (
+                actual.ok == expected.ok
+                and actual.data == expected.data
+                and actual.source_uri == expected.source_uri
+            )
+            tool_results.append(
+                {
+                    "tool_name": call["tool_name"],
+                    "matched": matched,
+                    "recorded_source_uri": expected.source_uri,
+                }
+            )
+
+        graph_output: dict[str, Any] | None = None
+        for checkpoint in original.get("checkpoints", []):
+            if checkpoint.get("phase") == "LANGGRAPH_COMPLETED":
+                state = checkpoint.get("state", {})
+                if isinstance(state, dict) and isinstance(state.get("output"), dict):
+                    graph_output = state["output"]
+                break
+        model_results: list[dict[str, Any]] = []
+        if graph_output is not None:
+            model_results = replay_recorded_model_trajectory(
+                graph_output,
+                incident,
+                incident.get("evidence", []),
+                (
+                    graph_output.get("incident_memory", [])
+                    if isinstance(graph_output.get("incident_memory"), list)
+                    else []
+                ),
+            )
+
+        expected_model_trajectory = (
+            original.get("model_config", {}).get("provider") != "deterministic"
+        )
+        tools_matched = bool(tool_results) and all(
+            item["matched"] for item in tool_results
+        )
+        models_matched = (
+            bool(model_results)
+            and all(item["matched"] for item in model_results)
+            if expected_model_trajectory
+            else True
+        )
+        replayable = tools_matched and models_matched
         return {
             "incident_id": incident_id,
             "source_run_id": run_id,
             "mode": "recorded",
-            "status": "REPLAYED",
+            "status": "REPLAYED" if replayable else "UNREPLAYABLE",
             "span_count": len(original["events"]),
             "side_effects": 0,
-            "deterministic": True,
+            "deterministic": replayable,
+            "tool_calls_replayed": len(tool_results),
+            "model_artifacts_replayed": len(model_results),
+            "tool_results": tool_results,
+            "model_results": model_results,
+            "model_trajectory_expected": expected_model_trajectory,
         }
 
     async def _transition(
@@ -1036,25 +1675,43 @@ class IncidentEngine:
                 actor="investigator-agent",
                 idempotency_key=f"{incident['id'].lower()}-{tool_name}",
             )
-            result = await self.transport.call_tool(
+            tool_arguments = {
+                "service": incident["service"],
+                "environment": incident["environment"],
+                "namespace": target["namespace"],
+            }
+            result = await self._call_tool(
                 tool_name,
-                {
-                    "service": incident["service"],
-                    "environment": incident["environment"],
-                    "namespace": target["namespace"],
-                },
+                tool_arguments,
                 context,
             )
+            sanitized = sanitize_tool_payload(tool_name, result.data)
+            source_uri = sanitize_source_uri(result.source_uri)
             collected.append(
                 {
                     "source_type": source_type,
-                    "source_uri": result.source_uri,
+                    "source_uri": source_uri,
                     "title": title,
-                    "content": self._summarize_result(tool_name, result.data),
+                    "content": self._summarize_result(tool_name, sanitized.data),
                     "metadata": {
-                        "raw": result.data,
+                        "raw": sanitized.data,
                         "duration_ms": result.duration_ms,
                         "ok": result.ok,
+                        "trust_classification": "external_untrusted_observation",
+                        "redaction_count": sanitized.redaction_count,
+                        "dropped_fields": list(sanitized.dropped_fields),
+                        "prompt_injection_detected": sanitized.injection_detected,
+                        "injection_indicators": list(
+                            sanitized.injection_indicators
+                        ),
+                        "recording": {
+                            "tool_name": tool_name,
+                            "arguments": tool_arguments,
+                            "result": sanitized.data,
+                            "source_uri": source_uri,
+                            "duration_ms": result.duration_ms,
+                            "ok": result.ok,
+                        },
                     },
                 }
             )
@@ -1067,7 +1724,7 @@ class IncidentEngine:
                 "investigator",
                 "OK" if result.ok else "ERROR",
                 result.duration_ms,
-                {"source_uri": result.source_uri},
+                {"source_uri": source_uri},
             )
         evidence_ids = await self._db(
             self.store.add_evidence, incident["id"], collected
@@ -1077,6 +1734,33 @@ class IncidentEngine:
             [item["content"] for item in collected],
         )
         return evidence_ids
+
+    async def _load_incident_memory(
+        self,
+        incident: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        limit = self.settings.incident_memory_limit
+        if limit <= 0:
+            return []
+        if self.evidence_index.enabled:
+            query = " ".join(
+                str(incident.get(field, ""))
+                for field in ("service", "title", "description")
+            )
+            memories = await self.evidence_index.search_incident_memory(
+                query,
+                str(incident.get("service", "")),
+                str(incident.get("id", "")),
+                limit,
+            )
+            if memories:
+                return memories
+        return await self._db(
+            self.store.incident_memory,
+            str(incident.get("service", "")),
+            str(incident.get("id", "")),
+            limit,
+        )
 
     @staticmethod
     def _summarize_result(tool_name: str, data: dict[str, Any]) -> str:
@@ -1112,11 +1796,18 @@ class IncidentEngine:
             f"{data['deployed_minutes_before_alert']} minutes before the alert."
         )
 
-    async def _verify(self, incident: dict[str, Any], run_id: str) -> dict[str, Any]:
+    async def _verify(
+        self,
+        incident: dict[str, Any],
+        run_id: str,
+        target_override: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        verification_target = target_override or self._target_binding(incident)
         if self.settings.verification_url_template:
             url = self.settings.verification_url_template.format(
                 service=incident["service"],
-                namespace=self._target_binding(incident)["namespace"],
+                namespace=verification_target["namespace"],
+                name=verification_target["name"],
             )
             started = asyncio.get_running_loop().time()
             try:
@@ -1158,14 +1849,14 @@ class IncidentEngine:
                 "restart_count_after": 0,
                 "mode": "simulation",
             }
-        target = self._target_binding(incident)
+        target = verification_target
 
         async def verify_tool(
             tool_name: str,
             arguments: dict[str, Any],
             suffix: str,
         ):
-            return await self.transport.call_tool(
+            return await self._call_tool(
                 tool_name,
                 arguments,
                 ToolContext(
@@ -1330,7 +2021,7 @@ class IncidentEngine:
             actor="preflight-controller",
             idempotency_key=f"{incident['id'].lower()}-{run_id.lower()}-preflight",
         )
-        result = await self.transport.call_tool(
+        result = await self._call_tool(
             "kubernetes.get_deployment",
             dict(target),
             context,

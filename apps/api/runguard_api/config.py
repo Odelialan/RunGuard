@@ -28,6 +28,7 @@ class Settings:
     cors_origins: tuple[str, ...]
     cors_origin_regex: str
     public_base_url: str | None
+    egress_proxy_url: str | None
     execution_mode: str
     connector_mode: str
     mcp_prometheus_url: str | None
@@ -72,12 +73,22 @@ class Settings:
     oidc_algorithms: tuple[str, ...]
     oidc_roles_claim: str
     rate_limit_per_minute: int
+    preauth_rate_limit_per_minute: int
     max_request_body_bytes: int
+    protect_diagnostics: bool
+    diagnostics_token: str | None
     prometheus_webhook_secret: str | None
     langgraph_checkpoint_backend: str
     langgraph_checkpoint_encryption_key: str | None
     auto_recover: bool
     recovery_concurrency: int
+    execution_strategy: str
+    canary_traffic_steps: tuple[int, ...]
+    incident_tool_call_budget: int
+    incident_timeout_seconds: int
+    incident_token_budget_per_call: int
+    incident_token_budget_total: int
+    incident_memory_limit: int
     prompt_version: str
     policy_version: str
 
@@ -120,6 +131,7 @@ def load_settings() -> Settings:
             ),
         ),
         public_base_url=os.getenv("RUNGUARD_PUBLIC_BASE_URL") or None,
+        egress_proxy_url=os.getenv("RUNGUARD_EGRESS_PROXY_URL") or None,
         execution_mode=os.getenv("RUNGUARD_EXECUTION_MODE", "simulation"),
         connector_mode=os.getenv("RUNGUARD_CONNECTOR_MODE", "mock"),
         mcp_prometheus_url=os.getenv("RUNGUARD_MCP_PROMETHEUS_URL") or None,
@@ -145,7 +157,7 @@ def load_settings() -> Settings:
         ),
         target_inventory_json=os.getenv("RUNGUARD_TARGET_INVENTORY_JSON", "{}"),
         kubernetes_runner_image=os.getenv(
-            "RUNGUARD_KUBERNETES_RUNNER_IMAGE", "ghcr.io/odelialan/runguard-runner:1.2.1"
+            "RUNGUARD_KUBERNETES_RUNNER_IMAGE", "ghcr.io/odelialan/runguard-runner:1.4.0"
         ),
         kubernetes_service_account=os.getenv(
             "RUNGUARD_KUBERNETES_SERVICE_ACCOUNT", "runguard-executor"
@@ -180,9 +192,14 @@ def load_settings() -> Settings:
         ),
         oidc_roles_claim=os.getenv("RUNGUARD_OIDC_ROLES_CLAIM", "roles"),
         rate_limit_per_minute=int(os.getenv("RUNGUARD_RATE_LIMIT_PER_MINUTE", "120")),
+        preauth_rate_limit_per_minute=int(
+            os.getenv("RUNGUARD_PREAUTH_RATE_LIMIT_PER_MINUTE", "30")
+        ),
         max_request_body_bytes=int(
             os.getenv("RUNGUARD_MAX_REQUEST_BODY_BYTES", "1048576")
         ),
+        protect_diagnostics=_bool("RUNGUARD_PROTECT_DIAGNOSTICS", False),
+        diagnostics_token=os.getenv("RUNGUARD_DIAGNOSTICS_TOKEN") or None,
         prometheus_webhook_secret=os.getenv("RUNGUARD_PROMETHEUS_WEBHOOK_SECRET") or None,
         langgraph_checkpoint_backend=os.getenv(
             "RUNGUARD_LANGGRAPH_CHECKPOINT_BACKEND",
@@ -191,13 +208,44 @@ def load_settings() -> Settings:
         langgraph_checkpoint_encryption_key=os.getenv("LANGGRAPH_AES_KEY") or None,
         auto_recover=_bool("RUNGUARD_AUTO_RECOVER", False),
         recovery_concurrency=int(os.getenv("RUNGUARD_RECOVERY_CONCURRENCY", "4")),
-        prompt_version=os.getenv("RUNGUARD_PROMPT_VERSION", "1.2.1"),
-        policy_version=os.getenv("RUNGUARD_POLICY_VERSION", "1.2.1"),
+        execution_strategy=os.getenv("RUNGUARD_EXECUTION_STRATEGY", "direct").lower(),
+        canary_traffic_steps=tuple(
+            int(item.strip())
+            for item in os.getenv("RUNGUARD_CANARY_TRAFFIC_STEPS", "5,25,50").split(",")
+            if item.strip()
+        ),
+        incident_tool_call_budget=int(
+            os.getenv("RUNGUARD_INCIDENT_TOOL_CALL_BUDGET", "24")
+        ),
+        incident_timeout_seconds=int(
+            os.getenv("RUNGUARD_INCIDENT_TIMEOUT_SECONDS", "900")
+        ),
+        incident_token_budget_per_call=int(
+            os.getenv("RUNGUARD_INCIDENT_TOKEN_BUDGET_PER_CALL", "4096")
+        ),
+        incident_token_budget_total=int(
+            os.getenv("RUNGUARD_INCIDENT_TOKEN_BUDGET_TOTAL", "100000")
+        ),
+        incident_memory_limit=int(os.getenv("RUNGUARD_INCIDENT_MEMORY_LIMIT", "5")),
+        prompt_version=os.getenv("RUNGUARD_PROMPT_VERSION", "1.4.0"),
+        policy_version=os.getenv("RUNGUARD_POLICY_VERSION", "1.4.0"),
     )
 
 
 def validate_settings(settings: Settings) -> None:
     inventory = parse_target_inventory(settings.target_inventory_json)
+    allowed_oidc_algorithms = {
+        "RS256",
+        "RS384",
+        "RS512",
+        "PS256",
+        "PS384",
+        "PS512",
+        "ES256",
+        "ES384",
+        "ES512",
+        "EdDSA",
+    }
     if settings.auth_mode not in {"disabled", "api_key", "oidc"}:
         raise RuntimeError("RUNGUARD_AUTH_MODE must be disabled, api_key, or oidc.")
     if settings.connector_mode not in {"mock", "hybrid", "production", "mcp"}:
@@ -208,6 +256,46 @@ def validate_settings(settings: Settings) -> None:
         )
     if settings.recovery_concurrency < 1 or settings.recovery_concurrency > 32:
         raise RuntimeError("RUNGUARD_RECOVERY_CONCURRENCY must be between 1 and 32.")
+    if settings.execution_strategy not in {"direct", "shadow", "canary"}:
+        raise RuntimeError(
+            "RUNGUARD_EXECUTION_STRATEGY must be direct, shadow, or canary."
+        )
+    if (
+        not settings.canary_traffic_steps
+        or tuple(sorted(set(settings.canary_traffic_steps)))
+        != settings.canary_traffic_steps
+        or any(step < 1 or step > 99 for step in settings.canary_traffic_steps)
+    ):
+        raise RuntimeError(
+            "RUNGUARD_CANARY_TRAFFIC_STEPS must be unique ascending percentages from 1 to 99."
+        )
+    if not 6 <= settings.incident_tool_call_budget <= 200:
+        raise RuntimeError("RUNGUARD_INCIDENT_TOOL_CALL_BUDGET must be between 6 and 200.")
+    if not 30 <= settings.incident_timeout_seconds <= 7200:
+        raise RuntimeError("RUNGUARD_INCIDENT_TIMEOUT_SECONDS must be between 30 and 7200.")
+    if not 256 <= settings.incident_token_budget_per_call <= 32768:
+        raise RuntimeError(
+            "RUNGUARD_INCIDENT_TOKEN_BUDGET_PER_CALL must be between 256 and 32768."
+        )
+    if not (
+        settings.incident_token_budget_per_call
+        <= settings.incident_token_budget_total
+        <= 1_000_000
+    ):
+        raise RuntimeError(
+            "RUNGUARD_INCIDENT_TOKEN_BUDGET_TOTAL must be at least the per-call budget "
+            "and no greater than 1000000."
+        )
+    if not 0 <= settings.incident_memory_limit <= 10:
+        raise RuntimeError("RUNGUARD_INCIDENT_MEMORY_LIMIT must be between 0 and 10.")
+    if not 1 <= settings.preauth_rate_limit_per_minute <= 10000:
+        raise RuntimeError(
+            "RUNGUARD_PREAUTH_RATE_LIMIT_PER_MINUTE must be between 1 and 10000."
+        )
+    if settings.protect_diagnostics and not settings.diagnostics_token:
+        raise RuntimeError(
+            "RUNGUARD_DIAGNOSTICS_TOKEN is required when diagnostics protection is enabled."
+        )
     if not 1024 <= settings.max_request_body_bytes <= 10 * 1024 * 1024:
         raise RuntimeError(
             "RUNGUARD_MAX_REQUEST_BODY_BYTES must be between 1024 and 10485760."
@@ -225,6 +313,11 @@ def validate_settings(settings: Settings) -> None:
         settings.oidc_issuer and settings.oidc_audience and settings.oidc_jwks_url
     ):
         raise RuntimeError("OIDC auth requires issuer, audience, and JWKS URL.")
+    if settings.auth_mode == "oidc" and (
+        not settings.oidc_algorithms
+        or any(algorithm not in allowed_oidc_algorithms for algorithm in settings.oidc_algorithms)
+    ):
+        raise RuntimeError("OIDC auth requires an explicit asymmetric signing algorithm.")
     if (
         settings.langgraph_checkpoint_backend == "postgres"
         and not settings.database_url
@@ -252,6 +345,19 @@ def validate_settings(settings: Settings) -> None:
             raise RuntimeError(
                 f"Target inventory service {service!r} uses a namespace outside the allowlist."
             )
+        if settings.execution_strategy == "canary":
+            canary_fields = {
+                "canary_name",
+                "http_route_name",
+                "stable_service",
+                "canary_service",
+            }
+            missing_canary = sorted(canary_fields - target.keys())
+            if missing_canary:
+                raise RuntimeError(
+                    f"Canary execution target {service!r} is missing: "
+                    + ", ".join(missing_canary)
+                )
     if settings.environment.strip().lower() in {"production", "prod"} and not (
         settings.enforce_production_guards
     ):
@@ -265,6 +371,8 @@ def validate_settings(settings: Settings) -> None:
         "RUNGUARD_REDIS_URL": settings.redis_url,
         "RUNGUARD_PROMETHEUS_WEBHOOK_SECRET": settings.prometheus_webhook_secret,
         "RUNGUARD_OTEL_EXPORTER_OTLP_ENDPOINT": settings.otel_endpoint,
+        "RUNGUARD_A2A_REVIEWER_URL": settings.a2a_reviewer_url,
+        "RUNGUARD_A2A_REVIEWER_TOKEN": settings.a2a_reviewer_token,
         "LANGGRAPH_AES_KEY": settings.langgraph_checkpoint_encryption_key,
     }
     missing = [name for name, value in required.items() if not value]
@@ -272,12 +380,20 @@ def validate_settings(settings: Settings) -> None:
         raise RuntimeError(f"Production guard validation failed; missing: {', '.join(missing)}")
     if settings.auth_mode == "disabled":
         raise RuntimeError("Production guards require API key or OIDC authentication.")
+    if not settings.protect_diagnostics or not settings.diagnostics_token:
+        raise RuntimeError(
+            "Production guards require protected readiness and metrics endpoints."
+        )
     if settings.cors_origin_regex:
         raise RuntimeError("Production guards require an explicit CORS origin allowlist.")
     if any(not origin.startswith("https://") for origin in settings.cors_origins):
         raise RuntimeError("Production CORS origins must use HTTPS.")
     if not settings.public_base_url:
         raise RuntimeError("Production guards require RUNGUARD_PUBLIC_BASE_URL.")
+    if not settings.egress_proxy_url:
+        raise RuntimeError(
+            "Production guards require RUNGUARD_EGRESS_PROXY_URL for controlled HTTPS egress."
+        )
     public_url = urlsplit(settings.public_base_url)
     if (
         public_url.scheme != "https"
@@ -290,6 +406,18 @@ def validate_settings(settings: Settings) -> None:
     ):
         raise RuntimeError(
             "RUNGUARD_PUBLIC_BASE_URL must be an HTTPS origin without credentials or a path."
+        )
+    proxy_url = urlsplit(settings.egress_proxy_url)
+    if (
+        proxy_url.scheme not in {"http", "https"}
+        or not proxy_url.hostname
+        or proxy_url.username
+        or proxy_url.password
+        or proxy_url.query
+        or proxy_url.fragment
+    ):
+        raise RuntimeError(
+            "RUNGUARD_EGRESS_PROXY_URL must be an HTTP(S) proxy URL without credentials."
         )
     https_endpoints = {
         "RUNGUARD_OIDC_ISSUER": (
@@ -310,15 +438,24 @@ def validate_settings(settings: Settings) -> None:
         if not value:
             continue
         endpoint = urlsplit(value)
+        internal_reviewer = (
+            name == "RUNGUARD_A2A_REVIEWER_URL"
+            and endpoint.scheme == "http"
+            and bool(endpoint.hostname)
+            and (
+                endpoint.hostname.endswith(".svc")
+                or endpoint.hostname.endswith(".svc.cluster.local")
+            )
+        )
         if (
-            endpoint.scheme != "https"
+            (endpoint.scheme != "https" and not internal_reviewer)
             or not endpoint.netloc
             or endpoint.username
             or endpoint.password
         ):
             raise RuntimeError(
-                f"{name} must use HTTPS and must not contain URL credentials "
-                "when production guards are enabled."
+                f"{name} must use HTTPS (or an in-cluster .svc URL for the Reviewer) "
+                "and must not contain URL credentials when production guards are enabled."
             )
     if settings.policy_backend != "opa":
         raise RuntimeError("Production guards require the OPA policy backend.")
@@ -397,11 +534,29 @@ def parse_target_inventory(raw: str) -> dict[str, dict[str, str]]:
             field: str(target.get(field, "")).strip()
             for field in required
         }
+        for optional_field in (
+            "canary_name",
+            "http_route_name",
+            "stable_service",
+            "canary_service",
+        ):
+            optional_value = str(target.get(optional_field, "")).strip()
+            if optional_value:
+                normalized[optional_field] = optional_value
         if not all(normalized.values()):
             raise RuntimeError(
                 f"Target inventory service {service!r} requires environment, namespace, and name."
             )
-        for field in ("namespace", "name"):
+        for field in (
+            "namespace",
+            "name",
+            "canary_name",
+            "http_route_name",
+            "stable_service",
+            "canary_service",
+        ):
+            if field not in normalized:
+                continue
             if len(normalized[field]) > 253 or not re.fullmatch(
                 r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?"
                 r"(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*",

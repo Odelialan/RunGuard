@@ -47,3 +47,21 @@ class EvidenceIndexer:
             return []
         vector = await self._model.aembed_query(query)
         return await asyncio.to_thread(self.store.semantic_evidence, vector, limit)
+
+    async def search_incident_memory(
+        self,
+        query: str,
+        service: str,
+        exclude_incident_id: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if not self.enabled:
+            return []
+        vector = await self._model.aembed_query(query)
+        return await asyncio.to_thread(
+            self.store.semantic_incident_memory,
+            vector,
+            service,
+            exclude_incident_id,
+            limit,
+        )
